@@ -1,0 +1,9 @@
+[package]
+name = "alife-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alife-common.workspace = true
+alife-ui.workspace = true
+eframe.workspace = true

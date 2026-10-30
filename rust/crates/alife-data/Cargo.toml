@@ -1,0 +1,10 @@
+[package]
+name = "alife-data"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alife-common.workspace = true
+alife-worldgen.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/alife-common",
+  "crates/alife-worldgen",
+  "crates/alife-evo",
+  "crates/alife-core",
+  "crates/alife-render",
+  "crates/alife-ui",
+  "crates/alife-view3d",
+  "crates/alife-data",
+  "crates/alife-app"
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+alife-common = { path = "crates/alife-common" }
+alife-worldgen = { path = "crates/alife-worldgen" }
+alife-evo = { path = "crates/alife-evo" }
+alife-core = { path = "crates/alife-core" }
+alife-render = { path = "crates/alife-render" }
+alife-ui = { path = "crates/alife-ui" }
+alife-data = { path = "crates/alife-data" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+glam = { version = "0.29", features = ["serde"] }
+noise = "0.9"
+eframe = { version = "0.29", features = ["wgpu"] }
+egui = "0.29"
+egui_plot = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+rayon = "1"
+alife-view3d = { path = "crates/alife-view3d" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+incremental = true

@@ -1,0 +1,9 @@
+[package]
+name = "alife-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+glam.workspace = true
+serde_json.workspace = true

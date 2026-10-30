@@ -1,0 +1,10 @@
+[package]
+name = "alife-worldgen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alife-common.workspace = true
+serde.workspace = true
+noise.workspace = true
+rayon.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "alife-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alife-common.workspace = true
+alife-worldgen.workspace = true
+alife-evo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+alife-data.workspace = true

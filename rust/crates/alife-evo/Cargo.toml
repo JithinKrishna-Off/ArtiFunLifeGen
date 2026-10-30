@@ -1,0 +1,8 @@
+[package]
+name = "alife-evo"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alife-common.workspace = true
+serde.workspace = true

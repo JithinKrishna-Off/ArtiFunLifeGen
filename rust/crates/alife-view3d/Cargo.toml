@@ -1,0 +1,17 @@
+[package]
+name = "alife-view3d"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+egui = { workspace = true }
+egui-wgpu = "0.29"
+wgpu = "22"
+glam = { workspace = true }
+bytemuck = { workspace = true }
+rayon = { workspace = true }
+alife-common = { workspace = true }
+alife-worldgen = { workspace = true }
+
+[dev-dependencies]
+pollster = "0.4"

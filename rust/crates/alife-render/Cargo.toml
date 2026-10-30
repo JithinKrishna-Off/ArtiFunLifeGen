@@ -1,0 +1,10 @@
+[package]
+name = "alife-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alife-common.workspace = true
+alife-worldgen.workspace = true
+alife-core.workspace = true
+egui.workspace = true
