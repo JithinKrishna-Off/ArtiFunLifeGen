@@ -16,9 +16,13 @@ impl View3D {
             CameraMode::Planet => fallback,
         };
         self.terrain
+            .set_cull(&frame.cam.view, &frame.cam.proj);
+        self.terrain
             .ensure_mesh(device, queue, &frame.world, frame.cam_mode, focus);
         queue.write_buffer(self.terrain.cam_buf(), 0, bytemuck::bytes_of::<CamUniform>(&frame.cam));
         self.grass
+            .update_gpu(device, queue, &frame);
+        self.morph
             .update_gpu(device, queue, &frame);
         *self.frame_of.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(frame_snap(frame)));
     }
@@ -30,11 +34,13 @@ impl View3D {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        if let Some((vbuf, count)) = self.terrain.vertex_buffer() {
+        if let Some((vbuf, _count)) = self.terrain.vertex_buffer() {
             pass.set_pipeline(self.terrain.pipeline());
             pass.set_bind_group(0, self.terrain.bind_group(), &[]);
             pass.set_vertex_buffer(0, vbuf.slice(..));
-            pass.draw(0..count, 0..1);
+            for range in self.terrain.draw_ranges() {
+                pass.draw(range.clone(), 0..1);
+            }
         }
         self.grass.draw_with(pass, frame.as_ref().map(Arc::as_ref));
         self.morph.draw_with(pass, frame.as_ref().map(Arc::as_ref));

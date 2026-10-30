@@ -1,26 +1,64 @@
 //! 3D terrain from the real `WorldModel` fields (owned by Agent A).
-//! M1 baseline: CPU-generated heightfield window mesh rebuilt only when the
-//! camera window or world model changes. Chunked LOD/caching is Agent A's
-//! deliverable layered onto this file; the draw API below must stay stable:
-//! `new(device, color_format, depth_format) -> Option<Terrain>`,
-//! `ensure_mesh(...)`, `cam_buf()`, `pipeline()`, `bind_group()`,
-//! `vertex_buffer()`, `invalidate()`.
+//! Chunked ring-LOD engine:
+//! - the world is tiled into 64-unit chunks (`CHUNK`), keyed by (chunk
+//!   coords, generation tag, aggregation); the camera lives on an "anchor"
+//!   chunk with hysteresis (re-anchor only when the focus drifts >= 2
+//!   chunks away), so ordinary moves rebuild nothing;
+//! - ring LOD by Chebyshev chunk distance: the near ring is full detail at
+//!   ~`world.cell` spacing, mid rings 2x, then 4x/8x, far rings degrade to
+//!   flat corner-quad plates; a 220k global vertex budget and a 128-chunk
+//!   cap (evict-farthest-first, because the plan is ranked near-first) are
+//!   enforced every `ensure_mesh`;
+//! - vertices live in ONE persistent buffer with per-chunk slot
+//!   sub-allocations (slot index * fixed vertex capacity = offset, real
+//!   verts = len; slot slack is first-vertex-padded and freed slots are
+//!   zeroed, so the legacy single-draw path `vertex_buffer()` + one draw
+//!   never rasterises garbage);
+//! - `set_cull` + `draw_ranges` add optional pure-math frustum culling
+//!   (chunk AABB vs planes from view-proj) for the coordinator; until
+//!   wired, `vertex_buffer()` keeps drawing everything;
+//! - world edits rebuild ONLY touched chunks (`invalidate` /
+//!   `invalidate_region`); generation_tag changes full-swap the cache.
+//!
+//! Draw API contract (unchanged): `new(device, color_format, depth_format)
+//! -> Option<Terrain>`, `ensure_mesh(...)`, `cam_buf()`, `pipeline()`,
+//! `bind_group()`, `vertex_buffer()`, `invalidate()`.
+
+#[path = "terrain_plan.rs"]
+pub mod plan;
+#[path = "terrain_mesh.rs"]
+pub mod mesh;
+#[path = "terrain_cull.rs"]
+pub mod cull;
+#[path = "terrain_tests.rs"]
+#[cfg(test)]
+mod tests;
 
 use crate::scene::{CameraMode, CamUniform};
 use alife_worldgen::WorldModel;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use std::collections::HashMap;
 use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 pub const SEA_LEVEL: f32 = 0.42;
 /// world-units of vertical scale per unit of the [0,1] elevation field
 pub const HEIGHT_SCALE: f32 = 46.0;
-/// habitat window in world units (square around the focus)
-pub const HABITAT_WINDOW: f32 = 260.0;
-/// planet view resolution square cap (vertices per axis)
-const PLANET_N: u32 = 220;
-const HABITAT_N: u32 = 170;
+/// chunk side in world units
+pub const CHUNK: f32 = 64.0;
+/// hard cap of live chunks (ring cache); eviction is farthest-first
+const MAX_CHUNKS: usize = 128;
+/// global vertex budget (used vertices, real geometry)
+const MAX_VERTS: u32 = 220_000;
+/// rayon build pool cap
+const BUILD_THREADS: usize = 4;
 
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+/// test-only: FNV-1a hash + len of the last real-vertex upload per slot,
+/// appended by `upload_slot` so tests can compare rebuilds byte-for-byte
+#[cfg(test)]
+pub(super) static TEST_VERT_TAP: std::sync::Mutex<Vec<(u32, u32, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct LandVert {
     pub pos: [f32; 3],
@@ -28,20 +66,68 @@ pub struct LandVert {
     pub color: [f32; 3],
 }
 
+/// resident chunk record (slot sub-allocation inside the persistent buffer)
+struct Resident {
+    bx: i32,
+    by: i32,
+    agg: u32,
+    tag: u32,
+    lod: u32,
+    slot: u32,
+    used: u32,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+}
+
+/// persistent vertex buffer with per-chunk slot sub-allocations
+struct Pool {
+    buf: wgpu::Buffer,
+    /// vertex capacity of one slot (full-detail block mesh size)
+    cap: u32,
+    /// allocated slot count; slot k occupies [k*cap, (k+1)*cap)
+    slots: u32,
+    /// bump high-water mark; freed slots are zero-padded before reuse
+    hi: u32,
+    free: Vec<u32>,
+}
+
+/// identity of the maintained plan (every input of the desired chunk set)
+struct CacheKey {
+    epoch: u64,
+    anchor: (i32, i32),
+    agg: u32,
+    cell: f32,
+    dims: (u32, u32),
+    wrap: (bool, bool),
+}
+
+/// one geometry job (a resident rebuild or a fresh chunk entering)
+struct BuildJob {
+    slot: u32,
+    bx: i32,
+    by: i32,
+    agg: u32,
+    tag: u32,
+    lod: u32,
+    params: mesh::GeoParams,
+}
+
 pub struct Terrain {
     pipeline: wgpu::RenderPipeline,
     cam_buf: wgpu::Buffer,
     cam_bg: wgpu::BindGroup,
-    verts: Vec<LandVert>,
-    vbuf: Option<wgpu::Buffer>,
+    pool: Option<Pool>,
+    res: Vec<Resident>,
+    anchor: Option<(i32, i32)>,
     key: Option<CacheKey>,
-}
-
-/// Identity of the built mesh: generation tag + window cell + res class.
-struct CacheKey {
-    epoch: u64,
-    cell: (i32, i32),
-    res: u32,
+    dirty_full: bool,
+    dirty_rects: Vec<(f32, f32, f32, f32)>,
+    last_regen: u32,
+    total_rebuilds: u64,
+    total_evictions: u64,
+    last_frustum: Option<cull::Frustum>,
+    ranges: Vec<std::ops::Range<u32>>,
+    wrap: (bool, bool),
 }
 
 pub fn terrain_height_at(world: &WorldModel, x: f32, y: f32) -> f32 {
@@ -53,19 +139,6 @@ pub fn biome_color(b: f32, e: f32, moisture: f32) -> [f32; 3] {
     let l = (e * 0.7 + 0.3).clamp(0.16, 1.0);
     let sat = (0.22 + 0.26 * moisture.clamp(0.0, 1.0) - 0.09 * (b * b).min(4.0)).clamp(0.05, 0.5);
     hsv_to_rgb(hue, sat, l)
-}
-
-fn tri_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
-    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    let n = [
-        ab[1] * ac[2] - ab[2] * ac[1],
-        ab[2] * ac[0] - ab[0] * ac[2],
-        ab[0] * ac[1] - ab[1] * ac[0],
-    ];
-    let m = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
-    let sign = if n[1] >= 0.0 { 1.0 } else { -1.0 };
-    [n[0] / m * sign, n[1] / m * sign, n[2] / m * sign]
 }
 
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
@@ -83,6 +156,19 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
         _ => (v, p, q),
     };
     [r, g, b]
+}
+
+// lazy <=4-thread build pool (never spins up before the first slow path)
+static BUILD_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+fn build_geos(world: &WorldModel, params: &[mesh::GeoParams]) -> Vec<mesh::ChunkGeo> {
+    let pool = BUILD_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(BUILD_THREADS)
+            .build()
+            .expect("terrain build thread pool")
+    });
+    pool.install(|| params.par_iter().map(|p| mesh::build(world, p)).collect())
 }
 
 impl Terrain {
@@ -178,9 +264,18 @@ impl Terrain {
             pipeline,
             cam_buf,
             cam_bg,
-            verts: Vec::with_capacity(1 << 17),
-            vbuf: None,
+            pool: None,
+            res: Vec::new(),
+            anchor: None,
             key: None,
+            dirty_full: false,
+            dirty_rects: Vec::new(),
+            last_regen: 0,
+            total_rebuilds: 0,
+            total_evictions: 0,
+            last_frustum: None,
+            ranges: Vec::new(),
+            wrap: (false, false),
         })
     }
 
@@ -196,109 +291,418 @@ impl Terrain {
         &self.cam_bg
     }
 
+    /// Marks every chunk dirty: the next ensure_mesh rebuilds all resident
+    /// chunks (world-wide edits).
     pub fn invalidate(&mut self) {
-        self.key = None;
+        self.dirty_full = true;
+    }
+
+    /// Scoped edit: only chunks whose AABB intersects the world rect
+    /// rebuild on the next ensure_mesh.
+    pub fn invalidate_region(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        self.dirty_rects.push((x0, y0, x1, y1));
+    }
+
+    /// Optional pure-math frustum culling: recompute per-chunk draw ranges
+    /// from the camera block. The coordinator should call this once per
+    /// frame with `frame.cam` (after ensure_mesh); until wired, everything
+    /// stays drawn and `draw_ranges()` lists all resident spans.
+    pub fn set_cull(&mut self, view: &[[f32; 4]; 4], proj: &[[f32; 4]; 4]) {
+        self.last_frustum = Some(cull::Frustum::from_cam(view, proj));
+        self.recompute_ranges();
+    }
+
+    /// Draw ranges (vertex index ranges within the persistent buffer) to
+    /// draw this frame, merged where contiguous.
+    pub fn draw_ranges(&self) -> &[std::ops::Range<u32>] {
+        &self.ranges
+    }
+
+    // ------------------------------------------------- state getters
+
+    pub fn resident_chunks(&self) -> usize {
+        self.res.len()
+    }
+
+    /// number of chunks (re)generated during the most recent ensure_mesh
+    /// that did any work; 0 on a cheap hit
+    pub fn last_ensure_rebuilds(&self) -> u32 {
+        self.last_regen
+    }
+
+    pub fn used_verts(&self) -> u32 {
+        self.res.iter().map(|r| r.used).sum()
+    }
+
+    pub fn total_evictions(&self) -> u64 {
+        self.total_evictions
+    }
+
+    pub fn total_rebuilds(&self) -> u64 {
+        self.total_rebuilds
+    }
+
+    pub fn slot_cap(&self) -> u32 {
+        self.pool.as_ref().map(|p| p.cap).unwrap_or(0)
+    }
+
+    /// legacy-safe draw count: every slot up to the bump high-water mark;
+    /// dead slots are zeroed and slot slack is padded, so this range can
+    /// never rasterise stale chunk geometry
+    pub fn legacy_draw_count(&self) -> u32 {
+        match &self.pool {
+            Some(p) => p.hi * p.cap,
+            None => 0,
+        }
     }
 
     pub fn vertex_buffer(&self) -> Option<(&wgpu::Buffer, u32)> {
-        self.vbuf.as_ref().map(|b| (b, (self.verts.len()) as u32))
+        let n = self.legacy_draw_count();
+        self.pool.as_ref().filter(|_| n > 0).map(|p| (&p.buf, n))
     }
 
-    /// Rebuilds the heightfield window mesh only when the region of interest
-    /// changed. Pure CPU generation from the world fields.
+    // ------------------------------------------------------- internals
+
+    fn aabb_wants_rebuild(&self, r: &Resident) -> bool {
+        self.dirty_full
+            || self.dirty_rects.iter().any(|&(x0, y0, x1, y1)| {
+                r.aabb_max[0] >= x0
+                    && r.aabb_min[0] <= x1
+                    && r.aabb_max[2] >= y0
+                    && r.aabb_min[2] <= y1
+            })
+    }
+
+    fn plan_signature_changed(&self, k: &CacheKey) -> bool {
+        match (&self.key, &self.pool) {
+            (Some(old), Some(_)) => {
+                old.epoch != k.epoch
+                    || old.anchor != k.anchor
+                    || old.agg != k.agg
+                    || old.cell != k.cell
+                    || old.dims != k.dims
+                    || old.wrap != k.wrap
+            }
+            _ => true,
+        }
+    }
+
+    fn recompute_ranges(&mut self) {
+        self.ranges.clear();
+        let cap = self.slot_cap();
+        let mut spans: Vec<(u32, u32)> = self
+            .res
+            .iter()
+            .filter(|r| match &self.last_frustum {
+                None => true,
+                Some(f) => f.aabb_visible(r.aabb_min, r.aabb_max),
+            })
+            .map(|r| (r.slot * cap, r.slot * cap + r.used))
+            .collect();
+        if spans.is_empty() {
+            return;
+        }
+        spans.sort_unstable();
+        let mut it = spans.into_iter().peekable();
+        while let Some((s, e)) = it.next() {
+            let mut cur = s..e;
+            while let Some(&(s2, e2)) = it.peek() {
+                if s2 == cur.end && e2 > cur.end {
+                    cur.end = e2;
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            self.ranges.push(cur);
+        }
+    }
+
+    fn create_pool(&mut self, device: &wgpu::Device, cap: u32) {
+        let slots = MAX_CHUNKS as u32;
+        let size = slots as u64 * cap as u64 * std::mem::size_of::<LandVert>() as u64;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view3d.terrain.chunks"),
+            size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.pool = Some(Pool { buf, cap, slots, hi: 0, free: Vec::new() });
+    }
+
+    fn alloc_slot(&mut self) -> Option<u32> {
+        let pool = self.pool.as_mut()?;
+        if let Some(s) = pool.free.pop() {
+            return Some(s);
+        }
+        if pool.hi < pool.slots {
+            let s = pool.hi;
+            pool.hi += 1;
+            return Some(s);
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn tap_log(slot: u32, verts: &[LandVert]) {
+        let bytes = bytemuck::cast_slice::<LandVert, u8>(verts);
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        TEST_VERT_TAP
+            .lock()
+            .expect("terrain vert tap")
+            .push((slot, verts.len() as u32, h));
+    }
+
+    /// one upload: real verts followed by first-vertex padding so a slot
+    /// never retains bytes of a previous occupant
+    fn upload_slot(&self, queue: &wgpu::Queue, slot: u32, verts: &[LandVert]) {
+        #[cfg(test)]
+        {
+            Self::tap_log(slot, verts);
+        }
+        if let Some(pool) = &self.pool {
+            let mut full = Vec::with_capacity(pool.cap as usize);
+            full.extend_from_slice(verts);
+            let first = verts[0];
+            while full.len() < pool.cap as usize {
+                full.push(first);
+            }
+            let byte_off = slot as u64 * pool.cap as u64 * std::mem::size_of::<LandVert>() as u64;
+            queue.write_buffer(&pool.buf, byte_off, bytemuck::cast_slice(&full));
+        }
+    }
+
+    /// zero a slot region (GPU mirror of an eviction; legacy draws never
+    /// rasterise dead slots)
+    fn zero_slot(&self, queue: &wgpu::Queue, slot: u32) {
+        if let Some(pool) = &self.pool {
+            let pad = LandVert {
+                pos: [0.0; 3],
+                normal: [0.0; 3],
+                color: [0.0; 3],
+            };
+            let mut full = Vec::with_capacity(pool.cap as usize);
+            while full.len() < pool.cap as usize {
+                full.push(pad);
+            }
+            let byte_off = slot as u64 * pool.cap as u64 * std::mem::size_of::<LandVert>() as u64;
+            queue.write_buffer(&pool.buf, byte_off, bytemuck::cast_slice(&full));
+        }
+    }
+
+    /// Rebuilds / maintains the chunk set for THIS frame's camera. Needs
+    /// device+queue for slot uploads; hits return before touching (or
+    /// building) anything.
     pub fn ensure_mesh(
         &mut self,
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        queue: &wgpu::Queue,
         world: &Arc<WorldModel>,
         mode: CameraMode,
         focus: (f32, f32),
     ) {
-        let (window, n) = match mode {
-            CameraMode::Planet => ((world.width.max(world.height) * 1.05).max(32.0), PLANET_N),
-            CameraMode::Orbit { .. } => (HABITAT_WINDOW, HABITAT_N),
-            CameraMode::Follow { .. } => (90.0, 120),
+        let agg = plan::agg_for_mode(&mode, world);
+        let cell = world.cell;
+        let nbx = plan::blocks_along(world.width, 1);
+        let nby = plan::blocks_along(world.height, 1);
+        let fcx = (((focus.0 / CHUNK).floor() as i32).clamp(0, nbx.max(1) as i32 - 1)).max(0);
+        let fcy = (((focus.1 / CHUNK).floor() as i32).clamp(0, nby.max(1) as i32 - 1)).max(0);
+        // hysteresis: re-anchor only when the focus drifts >= 2 chunks away
+        let anchor = match self.anchor {
+            Some(a) => {
+                let d = (a.0 - fcx).abs().max(a.1 - fcy).abs();
+                if d >= 2 {
+                    (fcx, fcy)
+                } else {
+                    a
+                }
+            }
+            None => (fcx, fcy),
         };
-        let cell_key = (
-            (focus.0 / 32.0).floor() as i32,
-            (focus.1 / 32.0).floor() as i32,
-        );
+        self.anchor = Some(anchor);
+
+        if !self.wrap.0 && !self.wrap.1 {
+            self.wrap = mesh::edge_wrap(world);
+        }
+
         let new_key = CacheKey {
             epoch: world.generation_tag as u64,
-            cell: cell_key,
-            res: n,
+            anchor,
+            agg,
+            cell,
+            dims: (nbx, nby),
+            wrap: self.wrap,
         };
-        let same = self
-            .key
-            .as_ref()
-            .map(|k| k.epoch == new_key.epoch && k.cell == new_key.cell && k.res == new_key.res)
-            .unwrap_or(false);
-        if same && self.vbuf.is_some() {
+        let plan_changed = self.plan_signature_changed(&new_key);
+        let dirty_any = self.dirty_full || !self.dirty_rects.is_empty();
+        if !plan_changed && !dirty_any && self.pool.is_some() {
+            self.last_regen = 0; // cheap hit: plan + cache stay valid
             return;
         }
-        self.verts.clear();
-        let (nx, ny) = (n, (n as f32 * 0.72).max(24.0) as u32);
-        let dx = window / nx as f32;
-        let dy = (window * 0.72) / ny as f32;
-        let x0 = (focus.0 - window * 0.5).clamp(0.0, world.width.max(0.0));
-        let y0 = (focus.1 - window * 0.5).clamp(0.0, world.height.max(0.0));
-        let bounce = |v: f32, max: f32| v.min((max - 0.01).max(0.0));
-        // sample the world fields on the grid
-        let mut h = Vec::with_capacity(((nx + 1) * (ny + 1)) as usize);
-        let mut bio = Vec::with_capacity(((nx + 1) * (ny + 1)) as usize);
-        let mut moist = Vec::with_capacity(((nx + 1) * (ny + 1)) as usize);
-        for iy in 0..=ny {
-            let wy = bounce(y0 + dy * iy as f32, world.height);
-            for ix in 0..=nx {
-                let wx = bounce(x0 + dx * ix as f32, world.width);
-                h.push(world.sample_elevation(wx, wy));
-                bio.push(world.biome.sample(wx, wy, world.width, world.height));
-                moist.push(world.sample_moisture(wx, wy));
-            }
+
+        // ------------------------------- slow path: reconcile the cache
+        let mut planned = Vec::with_capacity(256);
+        plan::build_plan(world, agg, anchor, self.wrap, &mut planned);
+
+        let cap = plan::verts_of(cell, agg, 1);
+        let pool_mismatch = self.pool.as_ref().map(|p| p.cap != cap).unwrap_or(true);
+        if pool_mismatch {
+            self.res.clear();
+            self.create_pool(device, cap);
         }
-        let stride = nx as usize + 1;
-        let at = |ix: usize, iy: usize| -> LandVert {
-            let i = iy * stride + ix;
-            let e = h[i];
-            let b = bio[i];
-            let m = moist[i];
-            let wx = bounce(x0 + dx * ix as f32, world.width);
-            let wy = bounce(y0 + dy * iy as f32, world.height);
-            LandVert {
-                pos: [wx, e * HEIGHT_SCALE, wy],
-                normal: [0.0, 1.0, 0.0],
-                color: biome_color(b, e, m),
-            }
-        };
-        for iy in 0..ny as usize {
-            for ix in 0..nx as usize {
-                let p00 = at(ix, iy);
-                let p10 = at(ix + 1, iy);
-                let p01 = at(ix, iy + 1);
-                let p11 = at(ix + 1, iy + 1);
-                // triangle winds depend on height so both get correct normals
-                for tri in [(p00, p01, p10), (p10, p01, p11)] {
-                    let (a, b, c) = tri;
-                    let nn = tri_normal(a.pos, b.pos, c.pos);
-                    if nn[1] < -0.9 {
-                        // inverted winding: flip vertices instead
-                        let _ = nn;
+
+        let tag = world.generation_tag;
+        let mut verts_used = self.res.iter().map(|r| r.used).sum::<u32>();
+
+        // desired additions; slots are claimed after evictions (phase B)
+        struct NewEntry {
+            bx: i32,
+            by: i32,
+            lod: u32,
+            params: mesh::GeoParams,
+        }
+        let mut new_entries: Vec<NewEntry> = Vec::new();
+        let mut jobs: Vec<BuildJob> = Vec::new();
+
+        // phase A: match planned chunks against residents
+        let by_pos: HashMap<(u32, u32, i32, i32), usize> = self            .res
+            .iter()
+            .enumerate()
+            .map(|(i, r)| ((r.tag, r.agg, r.bx, r.by), i))
+            .collect();
+        let mut visited = vec![false; self.res.len()];
+        for c in planned.iter().take(MAX_CHUNKS) {
+            match by_pos.get(&(tag, agg, c.bx, c.by)).copied() {
+                Some(i) => {
+                    visited[i] = true;
+                    let r = &self.res[i];
+                    if r.lod == c.lod && !self.aabb_wants_rebuild(r) {
+                        continue;
                     }
-                    let nrev = tri_normal(a.pos, c.pos, b.pos);
-                    self.verts.push(LandVert { pos: a.pos, normal: nrev, color: a.color });
-                    self.verts.push(LandVert { pos: c.pos, normal: nrev, color: c.color });
-                    self.verts.push(LandVert { pos: b.pos, normal: nrev, color: b.color });
+                    let newv = plan::verts_of(cell, agg, c.lod);
+                    verts_used = verts_used - r.used + newv;
+                    let slot = self.res[i].slot;
+                    jobs.push(BuildJob {
+                        slot,
+                        bx: c.bx,
+                        by: c.by,
+                        agg,
+                        tag,
+                        lod: c.lod,
+                        params: mesh::GeoParams::from_plan(world, *c, self.wrap),
+                    });
+                }
+                None => {
+                    let v = plan::verts_of(cell, agg, c.lod);
+                    let lod_eff = if verts_used + v <= MAX_VERTS {
+                        c.lod
+                    } else if verts_used + 6 <= MAX_VERTS {
+                        0 // flat-plate fallback under vertex pressure
+                    } else {
+                        continue; // fog covers the horizon; skip entirely
+                    };
+                    verts_used += plan::verts_of(cell, agg, lod_eff);
+                    new_entries.push(NewEntry {
+                        bx: c.bx,
+                        by: c.by,
+                        lod: lod_eff,
+                        params: mesh::GeoParams::from_plan(world, *c, self.wrap),
+                    });
                 }
             }
         }
-        let bytes = bytemuck::cast_slice(&self.verts).to_vec();
-        self.vbuf = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("view3d.terrain.vbuf"),
-            contents: &bytes,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        }));
+
+        // phase B: evict residents the plan no longer wants (every
+        // planned chunk is revisited early, so unvisited = farthest first)
+        let mut freed: Vec<u32> = Vec::new();
+        let mut kept: Vec<Resident> = Vec::with_capacity(self.res.len());
+        for (i, r) in std::mem::take(&mut self.res).into_iter().enumerate() {
+            if visited[i] {
+                kept.push(r);
+            } else {
+                freed.push(r.slot);
+                self.total_evictions += 1;
+            }
+        }
+        self.res = kept;
+        if let Some(pool) = self.pool.as_mut() {
+            pool.free.extend(from_slot(freed.as_slice()));
+        }
+
+        // phase C: claim slots for the desired additions
+        for e in new_entries {
+            match self.alloc_slot() {
+                Some(slot) => jobs.push(BuildJob {
+                    slot,
+                    bx: e.bx,
+                    by: e.by,
+                    agg,
+                    tag,
+                    lod: e.lod,
+                    params: e.params,
+                }),
+                None => break, // cache full; the plan heals on the next move
+            }
+        }
+
+        // phase D: build all geometry (rayon, <=4 threads) and upload
+        let params: Vec<mesh::GeoParams> = jobs.iter().map(|j| j.params).collect();
+        let geos = build_geos(world, &params);
+        let regen = geos.len() as u32;
+        for (job, geo) in jobs.into_iter().zip(geos) {
+            self.upload_slot(queue, job.slot, &geo.verts);
+            self.total_rebuilds += 1;
+            let used = geo.verts.len() as u32;
+            let find = self
+                .res
+                .iter()
+                .position(|r| r.tag == job.tag && r.agg == job.agg && r.bx == job.bx && r.by == job.by);
+            match find {
+                Some(i) => {
+                    let r = &mut self.res[i];
+                    r.lod = job.lod;
+                    r.used = used;
+                    r.aabb_min = geo.aabb_min;
+                    r.aabb_max = geo.aabb_max;
+                }
+                None => self.res.push(Resident {
+                    bx: job.bx,
+                    by: job.by,
+                    agg: job.agg,
+                    tag: job.tag,
+                    lod: job.lod,
+                    slot: job.slot,
+                    used,
+                    aabb_min: geo.aabb_min,
+                    aabb_max: geo.aabb_max,
+                }),
+            }
+        }
+
+        // phase E: zero every slot that was freed but not re-used
+        if let Some(pool) = self.pool.as_ref() {
+            let stale: Vec<u32> = pool.free.clone();
+            for slot in stale {
+                self.zero_slot(queue, slot);
+            }
+        }
+
+        // finalize
+        self.res.sort_by_key(|r| r.slot); // deterministic resident order
+        self.dirty_full = false;
+        self.dirty_rects.clear();
         self.key = Some(new_key);
+        self.last_regen = regen;
+        self.recompute_ranges();
     }
+}
+
+fn from_slot(s: &[u32]) -> impl Iterator<Item = u32> + '_ {
+    s.iter().copied()
 }
 
 const TERRAIN_VS: &str = r#"
@@ -353,10 +757,14 @@ fn fs(in: FsIn) -> @location(0) vec4<f32> {
     let sun_dir = normalize(vec3(0.35, 0.55, 0.85));
     let lambert = clamp(dot(normalize(in.normal), sun_dir), 0.0, 1.0);
     var c = in.color * (0.30 + 0.80 * lambert);
-    // underwater / shoreline tint where the height is close to/below sea level
+    // underwater / shoreline tint where the height is close to/below sea
+    // level; the tint is modulated by a slow wave over world position and
+    // uniform time (world_wh_time_flash.z) so open water shimmers
     let hn = in.world.y / 46.0;
     let under = clamp((0.42 - hn) * 6.5, 0.0, 1.0);
-    c = mix(c, vec3(0.20, 0.48, 0.56), under * 0.85);
+    let wave = sin(in.world.x * 0.11 + cam.world_wh_time_flash.z * 1.9)
+        * sin(in.world.z * 0.13 - cam.world_wh_time_flash.z * 1.4);
+    c = mix(c, vec3(0.20, 0.48, 0.56), under * (0.70 + 0.15 * wave));
     let d = distance(in.world, cam.view_pos.xyz);
     let fog = clamp((d - 500.0) / 2600.0, 0.0, 0.62);
     let flash = clamp(cam.world_wh_time_flash.w, 0.0, 1.0);

@@ -1,0 +1,11 @@
+[package]
+name = "alife-governor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+sysinfo = "0.30"
+
+[dev-dependencies]
+serde_json = { workspace = true }

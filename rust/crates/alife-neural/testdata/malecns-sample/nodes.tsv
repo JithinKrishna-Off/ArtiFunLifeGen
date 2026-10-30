@@ -1,0 +1,5 @@
+# SYNTHETIC TEST DATA (see README.md) — not from any real dataset
+bodyId	type	superclass	status	somaSide
+1	motor	adult	Complete	left
+2	sensory	sensory	Partial	
+3	interneuron	CNS	Complete	right

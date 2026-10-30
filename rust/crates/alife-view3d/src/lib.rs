@@ -49,6 +49,8 @@ impl View3D {
         let mut grass = grass::Grass::new(&rs.device)?;
         grass.ensure_pipeline(&rs.device, rs.target_format, wgpu::TextureFormat::Depth32Float);
         let morph = morph::Morph::new(&rs.device)?;
+        let mut morph = morph;
+        morph.ensure_pipeline(&rs.device, rs.target_format, wgpu::TextureFormat::Depth32Float);
         Some(View3D { terrain, grass, morph, frame_of: Default::default() })
     }
 }

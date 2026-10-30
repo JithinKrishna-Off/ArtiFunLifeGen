@@ -9,6 +9,8 @@ members = [
   "crates/alife-ui",
   "crates/alife-view3d",
   "crates/alife-data",
+  "crates/alife-neural",
+  "crates/alife-governor",
   "crates/alife-app"
 ]
 
@@ -34,6 +36,8 @@ egui_plot = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
 alife-view3d = { path = "crates/alife-view3d" }
+alife-neural = { path = "crates/alife-neural" }
+alife-governor = { path = "crates/alife-governor" }
 
 [profile.release]
 opt-level = 3

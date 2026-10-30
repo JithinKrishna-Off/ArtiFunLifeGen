@@ -1,0 +1,17 @@
+{
+  "format": "flybrain-normalized-connectome",
+  "format_version": 1,
+  "dataset": "SYNTHETIC sample (not real MaleCNS data)",
+  "source_files": [
+    "SYNTHETIC-sample-weights.feather",
+    "SYNTHETIC-sample-annotations.feather"
+  ],
+  "converter": "convert_malecns.py",
+  "converter_version": "1.0.0",
+  "source_sha256": "",
+  "rows_in": 5,
+  "rows_out_edges": 5,
+  "rows_out_nodes": 3,
+  "converted_at_utc": "2026-10-30T00:00:00Z",
+  "notes": "Hand-written synthetic sample for importer unit tests only."
+}

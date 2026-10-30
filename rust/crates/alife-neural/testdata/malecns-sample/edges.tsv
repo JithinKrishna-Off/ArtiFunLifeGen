@@ -1,0 +1,7 @@
+# SYNTHETIC TEST DATA (see README.md) — not from any real dataset
+body_pre	body_post	weight
+1	2	0.5
+2	3	1.5
+3	1	-2.0
+1	3	3.25
+4	2	0.875

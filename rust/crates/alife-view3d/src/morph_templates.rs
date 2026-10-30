@@ -97,33 +97,35 @@ fn ico_base() -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
     (v, f)
 }
 
+/// midpoint vertex with subdivision cache (borrowed explicitly)
+fn mid(cache: &mut std::collections::HashMap<u64, u32>, pos: &mut Vec<[f32; 3]>, a: u32, b: u32) -> u32 {
+    let key = a.min(b) as u64 * (1 << 32) + a.max(b) as u64;
+    if let Some(m) = cache.get(&key) {
+        return *m;
+    }
+    let pa = pos[a as usize];
+    let pb = pos[b as usize];
+    let m = norm3([
+        (pa[0] + pb[0]) * 0.5,
+        (pa[1] + pb[1]) * 0.5,
+        (pa[2] + pb[2]) * 0.5,
+    ]);
+    pos.push(m);
+    cache.insert(key, pos.len() as u32 - 1);
+    pos.len() as u32 - 1
+}
+
 /// Subdivided unit icosphere as soup triangle positions (3 verts / face).
 fn sphere_soup(depth: u32) -> Vec<[f32; 3]> {
     let (mut pos, mut idx) = ico_base();
     let mut cache: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-    let mut mid = |a: u32, b: u32, pos: &mut Vec<[f32; 3]>| -> u32 {
-        let key = a.min(b) as u64 * (1 << 32) + a.max(b) as u64;
-        if let Some(m) = cache.get(&key) {
-            return *m;
-        }
-        let pa = pos[a as usize];
-        let pb = pos[b as usize];
-        let m = norm3([
-            (pa[0] + pb[0]) * 0.5,
-            (pa[1] + pb[1]) * 0.5,
-            (pa[2] + pb[2]) * 0.5,
-        ]);
-        pos.push(m);
-        cache.insert(key, pos.len() as u32 - 1);
-        pos.len() as u32 - 1
-    };
     for _ in 0..depth {
         let mut next = Vec::with_capacity(idx.len() * 4);
         for f in &idx {
             let (a, b, c) = (f[0], f[1], f[2]);
-            let ab = mid(a, b, &mut pos);
-            let bc = mid(b, c, &mut pos);
-            let ca = mid(c, a, &mut pos);
+            let ab = mid(&mut cache, &mut pos, a, b);
+            let bc = mid(&mut cache, &mut pos, b, c);
+            let ca = mid(&mut cache, &mut pos, c, a);
             for tri in [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]] {
                 next.push(tri);
             }
