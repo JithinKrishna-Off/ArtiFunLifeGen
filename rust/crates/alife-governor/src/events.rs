@@ -54,4 +54,6 @@ pub enum EventKind {
     Hardware,
     /// Computational-selection CU starvation review.
     ComputeSelection,
+    /// Timing-derived scheduling rebalance/advisory.
+    Scheduling,
 }

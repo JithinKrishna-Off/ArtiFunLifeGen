@@ -29,7 +29,7 @@ fn planet_to_habitat_reaches_full_orbit_state() {
     assert_eq!(c.mode(), Mode::Habitat);
     assert!(!c.transition_active());
     // fully settled onto the orbit anchor position (not just nearby)
-    let d = 260.0_f32;
+    let d = HABITAT_START_DIST;
     let want = Vec3::new(
         1400.0 + 0.6_f32.cos() * d,
         4.0 + 0.5 * d * 0.9 + 8.0,
@@ -198,9 +198,203 @@ fn transition_sweep_stays_cinematic_not_wild() {
     assert!(!c.transition_active());
 }
 
+// ------------------------------------------------------- queen cam / POV
+
 #[test]
-fn free_fly_q_descends_and_never_sinks_below_terrain() {
+fn queen_focus_request_uses_focus_dist_and_recenters_without_jump() {
     let mut c = CameraState::new();
+    let world = (2000.0, 2000.0);
+    settle(&mut c, CameraMode::Orbit { focus: (500.0, 500.0) }, world, 120, 2.0, None);
+
+    // fresh focus: follow-cam on the queen at 2.6 body lengths (42)
+    c.request_queen_focus(21, (600.0, 700.0), 2.0);
+    settle(&mut c, CameraMode::Follow { id: 21 }, world, 300, 2.0, Some((600.0, 700.0)));
+    assert_eq!(c.mode(), Mode::Organism);
+    assert_eq!(c.follow.id, 21);
+    assert_eq!(c.follow.dist, QUEEN_FOCUS_DIST);
+    assert!(!c.transition_active());
+    let want = Vec3::new(
+        600.0 + c.follow.yaw.cos() * QUEEN_FOCUS_DIST,
+        2.0 + 0.4 * QUEEN_FOCUS_DIST * 0.5 + 2.0,
+        700.0 + c.follow.yaw.sin() * QUEEN_FOCUS_DIST,
+    );
+    assert!((c.eye() - want).length() < 1.0, "eye spot {:?}", c.eye());
+    assert!(c.eye().is_finite() && c.look().is_finite());
+
+    // already focusing her: recenter pitch only — id, yaw and the zoomed
+    // user dist stay (no jump), the camera just eases back to 0.4 pitch
+    let mut ci = CamInput::default();
+    ci.drag = (0.0, 60.0); // shove pitch away from 0.4
+    ci.wheel = 40.0; // user zooms out too
+    for _ in 0..40 {
+        c.update(CameraMode::Follow { id: 21 }, &ci, world, Some((600.0, 700.0)), 2.0, dt());
+    }
+    assert!(c.follow.pitch > 0.5 && c.follow.dist > QUEEN_FOCUS_DIST + 20.0);
+    let (old_yaw, old_dist) = (c.follow.yaw, c.follow.dist);
+    c.request_queen_focus(21, (600.5, 700.3), 2.0);
+    assert_eq!(c.follow.id, 21);
+    assert_eq!(c.follow.dist, old_dist, "recenter keeps the user zoom");
+    assert_eq!(c.follow.yaw, old_yaw);
+    assert_eq!(c.follow.pitch, 0.4);
+    for _ in 0..200 {
+        c.update(CameraMode::Follow { id: 21 }, &CamInput::default(), world, Some((600.0, 700.0)), 2.0, dt());
+    }
+    assert!((c.follow.pitch - 0.4).abs() < 0.01);
+    assert!(c.eye().is_finite() && c.look().is_finite());
+}
+
+#[test]
+fn queen_pov_eye_look_math_drag_ignored_and_exit_lands_orbit() {
+    let mut c = CameraState::new();
+    let world = (2000.0, 2000.0);
+    let at = (1000.0, 1000.0);
+    let th = 3.0;
+    settle(&mut c, CameraMode::Orbit { focus: at }, world, 60, th, None);
+
+    // engage from the follow-cam style call; POV math then runs off the
+    // per-frame alpha channel while cam_mode stays Orbit { focus = queen }
+    c.set_queen_pov(Some((30, at, 0.0, QUEEN_BODY_LEN)));
+    assert!(c.pov_active());
+    let mode = CameraMode::Orbit { focus: at };
+    let mut ci = CamInput { pov_target: Some((at.0, at.1, 0.0, QUEEN_BODY_LEN)), ..CamInput::default() };
+    ci.drag = (500.0, 500.0); // POV pilot seat: drag must be ignored
+    ci.wheel = 100.0;
+    for _ in 0..400 {
+        c.update(mode, &ci, world, None, th, dt());
+    }
+    assert!(c.pov_active());
+    assert_eq!(c.mode(), Mode::Habitat); // grass window math keeps habitat
+
+    // documented POV math at heading 0, len 16:
+    //   fwd = 0.55 * 16 = 8.8, head = 3.0 + 0.35 * 16 = 8.6
+    //   gaze = 2.2 * 16 = 35.2; look drops by gaze * sin(0.28), horizon by
+    //   gaze * cos(0.28); the eye never flinches from the ignored drag
+    let head = th + 0.35 * QUEEN_BODY_LEN;
+    let fwd = 0.55 * QUEEN_BODY_LEN;
+    let gaze = 2.2 * QUEEN_BODY_LEN;
+    let eye_want = Vec3::new(at.0 + fwd, head, at.1);
+    let look_want = eye_want
+        + Vec3::new(
+            gaze * 0.28_f32.cos(),
+            -gaze * 0.28_f32.sin(),
+            0.0,
+        );
+    let eye = c.eye();
+    let look = c.look();
+    assert!(eye.distance(eye_want) < 1.2, "pov eye {:?} vs {eye_want:?}", eye);
+    assert!(look.distance(look_want) < 1.2, "pov look {:?} vs {look_want:?}", look);
+    assert!(eye.is_finite() && look.is_finite());
+
+    // non-finite alpha channel is rejected per-frame: state holds
+    let bad = CamInput { pov_target: Some((f32::NAN, f32::NAN, f32::NAN, -1.0)), ..CamInput::default() };
+    for _ in 0..30 {
+        c.update(mode, &bad, world, None, th, dt());
+    }
+    assert!(c.pov_at() == Some(at));
+    assert!(c.pov_active());
+
+    // heading smoothing: a new heading converges through shortest angles
+    let good = CamInput { pov_target: Some((at.0, at.1, std::f32::consts::PI, QUEEN_BODY_LEN)), ..CamInput::default() };
+    for _ in 0..200 {
+        c.update(mode, &good, world, None, th, dt());
+    }
+
+    // dismount: habitat orbit behind the queen at QUEEN_FOCUS_DIST; the
+    // dist warp is consumed by the habitat-entry snap
+    c.set_queen_pov(None);
+    assert!(!c.pov_active());
+    for _ in 0..400 {
+        c.update(mode, &CamInput::default(), world, None, th, dt());
+    }
+    assert!(!c.transition_active());
+    assert_eq!(c.mode(), Mode::Habitat);
+    assert_eq!(c.orbit.dist, QUEEN_FOCUS_DIST, "exit dist after warp");
+    assert!((c.orbit.focus.x - at.0).abs() < 0.5 && (c.orbit.focus.z - at.1).abs() < 0.5);
+    let want = Vec3::new(
+        c.orbit.focus.x + c.orbit.yaw.cos() * c.orbit.dist,
+        th + c.orbit.pitch * c.orbit.dist * 0.9 + 8.0,
+        c.orbit.focus.z + c.orbit.yaw.sin() * c.orbit.dist,
+    );
+    let settled = c.eye().distance(want);
+    assert!(settled < 1.0, "pov-exit drift {settled}");
+    assert!(c.eye().is_finite() && c.look().is_finite());
+}
+
+#[test]
+fn set_queen_pov_rejects_non_finite_and_recalling_keeps_look() {
+    let mut c = CameraState::new();
+    // garbage engage is a no-op
+    c.set_queen_pov(Some((1, (f32::NAN, 100.0), 0.0, QUEEN_BODY_LEN)));
+    assert!(!c.pov_active());
+    c.set_queen_pov(Some((1, (100.0, 100.0), f32::INFINITY, QUEEN_BODY_LEN)));
+    assert!(!c.pov_active());
+
+    // real engage, then a re-call with a moved target: look yaw continuity
+    c.set_queen_pov(Some((2, (500.0, 500.0), 0.0, QUEEN_BODY_LEN)));
+    let world = (2000.0, 2000.0);
+    let mode = CameraMode::Orbit { focus: (500.0, 500.0) };
+    let ci = CamInput { pov_target: Some((500.0, 500.0, 0.3, QUEEN_BODY_LEN)), ..CamInput::default() };
+    for _ in 0..60 {
+        c.update(mode, &ci, world, None, 2.0, dt());
+    }
+    let yaw_before = c.pov_active();
+    // re-engaging refreshes the target but never snaps the smoothed yaw
+    c.set_queen_pov(Some((2, (520.0, 510.0), 2.0, QUEEN_BODY_LEN)));
+    assert_eq!(yaw_before, true);
+    let ci2 = CamInput { pov_target: Some((520.0, 510.0, 2.0, QUEEN_BODY_LEN)), ..CamInput::default() };
+    for _ in 0..30 {
+        c.update(mode, &ci2, world, None, 2.0, dt());
+    }
+    // no NaN poisoning anywhere
+    assert!(c.eye().is_finite() && c.look().is_finite());
+}
+
+#[test]
+fn return_to_world_orbit_anchors_pov_then_fallback() {
+    let mut c = CameraState::new();
+    let world = (2000.0, 2000.0);
+    settle(&mut c, CameraMode::Planet, world, 60, 0.0, None);
+    let at = (900.0, 1100.0);
+    c.set_queen_pov(Some((9, at, 1.0, QUEEN_BODY_LEN)));
+    let mode = CameraMode::Orbit { focus: at };
+    let ci = CamInput { pov_target: Some((at.0, at.1, 1.0, QUEEN_BODY_LEN)), ..CamInput::default() };
+    for _ in 0..200 {
+        c.update(mode, &ci, world, None, 4.0, dt());
+    }
+
+    // World View from POV: back to the queen as the wide anchor
+    c.return_to_world_orbit(Some((1000.0, 1000.0)), 4.0);
+    assert!(!c.pov_active());
+    let mode = CameraMode::Orbit { focus: at };
+    for _ in 0..400 {
+        c.update(mode, &CamInput::default(), world, None, 4.0, dt());
+    }
+    assert_eq!(c.mode(), Mode::Habitat);
+    assert!(!c.transition_active());
+    assert_eq!(c.orbit.dist, HABITAT_START_DIST);
+    assert!((c.orbit.focus.x - at.0).abs() < 0.5 && (c.orbit.focus.z - at.1).abs() < 0.5);
+    assert!(c.eye().is_finite() && c.look().is_finite());
+
+    // from follow-cam: the fallback anchor wins (no POV to note)
+    c.request_follow(14, at, 4.0);
+    let mode = CameraMode::Follow { id: 14 };
+    for _ in 0..200 {
+        c.update(mode, &CamInput::default(), world, Some(at), 4.0, dt());
+    }
+    let fallback_src = (1234.0, 1234.0);
+    c.return_to_world_orbit(Some(fallback_src), 6.0);
+    assert_eq!(c.mode(), Mode::Planet, "return forces the habitat-entry snap");
+    let mode = CameraMode::Orbit { focus: fallback_src };
+    for _ in 0..400 {
+        c.update(mode, &CamInput::default(), world, None, 6.0, dt());
+    }
+    assert!((c.orbit.focus.x - fallback_src.0).abs() < 0.5 && (c.orbit.focus.z - fallback_src.1).abs() < 0.5);
+    assert_eq!(c.orbit.dist, HABITAT_START_DIST);
+    assert!(c.eye().is_finite() && c.look().is_finite());
+}
+
+#[test]
+fn free_fly_q_descends_and_never_sinks_below_terrain() {    let mut c = CameraState::new();
     let focus = (500.0, 500.0);
     settle(&mut c, CameraMode::Orbit { focus }, (2000.0, 2000.0), 60, 2.0, None);
     c.set_free_cam(true);

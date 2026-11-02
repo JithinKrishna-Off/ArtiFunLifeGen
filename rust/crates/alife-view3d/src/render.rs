@@ -5,6 +5,38 @@ use crate::View3D;
 use egui::epaint::PaintCallbackInfo;
 use egui_wgpu::{CallbackResources, CallbackTrait, ScreenDescriptor};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// TEMP diag counter: prints subsystem state every DIAG_EVERY update calls
+/// while ALIFE_VIEW3D_DIAG=1; stays silent otherwise.
+const DIAG_EVERY: u32 = 120;
+static DIAG_N: AtomicU32 = AtomicU32::new(0);
+
+fn diag_tick(view: &View3D) {
+    if std::env::var("ALIFE_VIEW3D_DIAG").map(|v| v == "1").unwrap_or(false)
+        && DIAG_N.fetch_add(1, Ordering::Relaxed) % DIAG_EVERY == 0
+    {
+        let frame = view
+            .frame_of
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let (t_buf, t_res, t_ranges, t_verts) = (
+            view.terrain.vertex_buffer().is_some(),
+            view.terrain.resident_chunks(),
+            view.terrain.draw_ranges().len(),
+            view.terrain.used_verts(),
+        );
+        let (g_total, g_chunks) = view.grass.diag_counts();
+        let (tn, sn, qun, qn) = view.morph.diag_plan();
+        eprintln!(
+            "[view3d diag] terrain(buf={t_buf} res={t_res} ranges={t_ranges} verts={t_verts}) \
+             grass(total={g_total} chunks={g_chunks}) morph(t={tn} s={sn} q={qun} b={qn}) \
+             frame={}",
+            frame.is_some()
+        );
+    }
+}
 
 impl View3D {
     /// Per-frame state-side update (called in `prepare`, before `paint`).
@@ -20,11 +52,17 @@ impl View3D {
         self.terrain
             .ensure_mesh(device, queue, &frame.world, frame.cam_mode, focus);
         queue.write_buffer(self.terrain.cam_buf(), 0, bytemuck::bytes_of::<CamUniform>(&frame.cam));
-        self.grass
-            .update_gpu(device, queue, &frame);
         self.morph
             .update_gpu(device, queue, &frame);
+        // queen visual footprint -> grass trample field (scaled to her body)
+        let queen_trample = self.morph.queen_footprint().map(|(x, z, r, s)| [x, z, r, s]);
+        self.grass
+            .update_gpu(device, queue, &frame, queen_trample);
+        // trees (Agent: trees) — after grass, no dependency on morph
+        self.tree
+            .update_gpu(device, queue, &frame);
         *self.frame_of.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(frame_snap(frame)));
+        diag_tick(self);
     }
 
     /// Record the actual draws (called in `paint`).
@@ -35,16 +73,55 @@ impl View3D {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         if let Some((vbuf, _count)) = self.terrain.vertex_buffer() {
+            pass.push_debug_group("alife3d.terrain");
             pass.set_pipeline(self.terrain.pipeline());
             pass.set_bind_group(0, self.terrain.bind_group(), &[]);
             pass.set_vertex_buffer(0, vbuf.slice(..));
             for range in self.terrain.draw_ranges() {
                 pass.draw(range.clone(), 0..1);
             }
+            pass.pop_debug_group();
         }
+        // trees (Agent: trees) — after the terrain pass, BEFORE grass so
+        // grass draws in front
+        pass.push_debug_group("alife3d.tree");
+        self.tree.draw_with(pass, frame.as_ref().map(Arc::as_ref));
+        pass.pop_debug_group();
+        pass.push_debug_group("alife3d.grass");
         self.grass.draw_with(pass, frame.as_ref().map(Arc::as_ref));
+        pass.pop_debug_group();
+        pass.push_debug_group("alife3d.morph-orgs");
         self.morph.draw_with(pass, frame.as_ref().map(Arc::as_ref));
+        pass.pop_debug_group();
+        // selection/hover overlay: one extra instanced draw (<= 3 ring quads)
+        pass.push_debug_group("alife3d.markers");
+        self.morph.draw_markers(pass);
+        pass.pop_debug_group();
     }
+
+    /// UI entry: arm this frame's selection markers. Indices are `Frame3D
+    /// orgs` slice indices (exactly what `picking::pick_org` /
+    /// `picking::hover_org` return; `id_queen = None` falls back to the
+    /// snapshot's `is_queen` flag). Cheap: a 3-Option snapshot under a mutex,
+    /// consumed by the next `Morph::update_gpu`.
+    pub fn set_selection_markers(
+        &self,
+        id_sel: Option<u32>,
+        id_hover: Option<u32>,
+        id_queen: Option<u32>,
+    ) {
+        crate::scene::markers::set_selection(id_sel, id_hover, id_queen);
+    }
+}
+
+/// Free-function alias for `View3D::set_selection_markers` (usable before the
+/// view is reachable, e.g. straight from the UI's click handler).
+pub fn set_selection_markers(
+    id_sel: Option<u32>,
+    id_hover: Option<u32>,
+    id_queen: Option<u32>,
+) {
+    crate::scene::markers::set_selection(id_sel, id_hover, id_queen);
 }
 
 /// strips the Arc'd fields out so the hand-off clone is cheap

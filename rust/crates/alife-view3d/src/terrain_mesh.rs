@@ -16,7 +16,7 @@
 
 use super::plan;
 use super::{biome_color, LandVert, HEIGHT_SCALE, SEA_LEVEL};
-use alife_worldgen::WorldModel;
+use alife_worldgen::{VirtualWorld, WorldModel, WorldSampling};
 
 const EDGE_TOL: f32 = 0.06;
 const EDGE_PROBES: usize = 5;
@@ -115,7 +115,25 @@ pub struct ChunkGeo {
 /// heightfield-gradient based (central differences, one-sided at rect
 /// edges, wrapped where the axis is periodic).
 pub fn build(world: &WorldModel, p: &GeoParams) -> ChunkGeo {
-    let (x0, y0, x1, y1) = plan::block_rect(world, p.agg, p.bx, p.by);
+    // Virtual-world extension: blocks beyond the simulated bounds (within
+    // the streamed margin ring) still get geometry through the deterministic
+    // `VirtualWorld` sampling; anything farther than EXTRA_CHUNKS_CAP stays
+    // empty (mirrors the pre-streaming degenerate-rect behaviour).
+    let nbx = plan::blocks_along(world.width, p.agg);
+    let nby = plan::blocks_along(world.height, p.agg);
+    let cap = plan::EXTRA_CHUNKS_CAP as i32;
+    if p.bx < -cap || p.bx >= nbx as i32 + cap || p.by < -cap || p.by >= nby as i32 + cap {
+        return ChunkGeo::default();
+    }
+    // virtual blocks outside the bounds use the unclamped rect; the clamped
+    // rect only degenerates for such blocks (the world grid is aligned)
+    let base = plan::block_rect(world, p.agg, p.bx, p.by);
+    let (x0, y0, x1, y1) = if base.2 <= base.0 || base.3 <= base.1 {
+        plan::block_rect_virtual(world, p.agg, p.bx, p.by)
+    } else {
+        base
+    };
+    let vw = VirtualWorld::wrap(world);
     let mut g = ChunkGeo::default();
     if p.steps == 0 || x1 - x0 <= 0.01 || y1 - y0 <= 0.01 {
         return g;
@@ -128,10 +146,12 @@ pub fn build(world: &WorldModel, p: &GeoParams) -> ChunkGeo {
     let mut wxv = Vec::with_capacity(stride);
     let mut wyv = Vec::with_capacity(stride);
     for ix in 0..stride {
-        wxv.push(wrap_span(x0 + dwx * ix as f32, world.width, p.wrap.0));
+        let raw = x0 + dwx * ix as f32;
+        wxv.push(if p.wrap.0 { wrap_span(raw, world.width, true) } else { raw });
     }
     for iy in 0..stride {
-        wyv.push(wrap_span(y0 + dwy * iy as f32, world.height, p.wrap.1));
+        let raw = y0 + dwy * iy as f32;
+        wyv.push(if p.wrap.1 { wrap_span(raw, world.height, true) } else { raw });
     }
 
     let n_samp = stride * stride;
@@ -142,10 +162,13 @@ pub fn build(world: &WorldModel, p: &GeoParams) -> ChunkGeo {
     for iy in 0..stride {
         for ix in 0..stride {
             let (wx, wy) = (wxv[ix], wyv[iy]);
-            h.push(world.sample_elevation(wx, wy));
-            col.push(world.biome.sample(wx, wy, world.width, world.height));
-            moist.push(world.sample_moisture(wx, wy));
-            haz.push(world.sample_hazard(wx, wy));
+            // sampling goes through the VirtualWorld view: bit-identical to
+            // the raw WorldModel samples inside the bounds; deterministic
+            // generated + boundary-blended values outside
+            h.push(vw.sample_elevation(wx, wy));
+            col.push(vw.biome_raw(wx, wy));
+            moist.push(vw.sample_moisture(wx, wy));
+            haz.push(vw.sample_hazard(wx, wy));
         }
     }
 
@@ -235,5 +258,157 @@ fn make_vert(
         pos: [wx, e * HEIGHT_SCALE, wy],
         normal,
         color: hazard_color(biome_color(b, e, m), hz),
+    }
+}
+
+#[cfg(test)]
+mod vw_tests {
+    use super::*;
+
+    fn small_world() -> WorldModel {
+        use alife_worldgen::WorldGenConfig;
+        alife_worldgen::generate(&WorldGenConfig {
+            seed: 777,
+            width: 512,
+            height: 512,
+            cell: 8,
+            terrain_scale: 1.0,
+            detail: 3,
+            warp: 0.35,
+            moisture_scale: 0.8,
+            resource_density: 1.0,
+            hazard_amount: 0.4,
+            fertility_contrast: 1.0,
+            hazard_pulse_period: 0.0,
+        })
+    }
+
+    #[test]
+    fn virtual_blocks_extend_terrain_beyond_world_bounds() {
+        let w = small_world();
+        let nx = plan::blocks_along(w.width, 1);
+        let ny = plan::blocks_along(w.height, 1);
+        // a margin block directly beyond the +x bound: real streamed geometry
+        let gp = GeoParams::from_plan(&w, plan::PlanChunk { agg: 1, bx: nx as i32, by: (ny / 2) as i32, lod: 1, dist: 1 }, (false, false));
+        let a = build(&w, &gp);
+        let b = build(&w, &gp);
+        assert!(
+            !a.verts.is_empty(),
+            "margin block beyond the +x bound streams geometry"
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<LandVert, u8>(&a.verts),
+            bytemuck::cast_slice::<LandVert, u8>(&b.verts),
+            "virtual blocks are deterministic"
+        );
+        // and the heights agree with the virtual sampler at those points
+        let vw = alife_worldgen::VirtualWorld::wrap(&w);
+        for v in a.verts.iter().step_by(64) {
+            let e = vw.sample_elevation(v.pos[0], v.pos[2]);
+            assert!((v.pos[1] - e * HEIGHT_SCALE).abs() < 1e-3);
+        }
+        // a negative-side margin block streams too
+        let gp = GeoParams::from_plan(&w, plan::PlanChunk { agg: 1, bx: -1, by: (ny / 2) as i32, lod: 1, dist: 1 }, (false, false));
+        assert!(!build(&w, &gp).verts.is_empty(), "margin block beyond -x streams");
+        // beyond the hard cap stays empty (legacy degenerate behaviour)
+        let far = GeoParams::from_plan(&w, plan::PlanChunk { agg: 1, bx: 50, by: 50, lod: 16, dist: 50 }, (false, false));
+        assert!(build(&w, &far).verts.is_empty(), "beyond the cap there is no geometry");
+    }
+
+    #[test]
+    fn in_bounds_geometry_survives_the_virtual_sampling_path() {
+        // byte-identity across rebuilds and non-negative sizes for real blocks
+        let w = small_world();
+        let gp = GeoParams::from_plan(&w, plan::PlanChunk { agg: 1, bx: 2, by: 3, lod: 2, dist: 1 }, (false, false));
+        let a = build(&w, &gp);
+        let b = build(&w, &gp);
+        assert!(!a.verts.is_empty());
+        assert_eq!(bytemuck::cast_slice::<LandVert, u8>(&a.verts), bytemuck::cast_slice::<LandVert, u8>(&b.verts));
+        for v in &a.verts {
+            assert!(v.pos[0] >= 0.0 && v.pos[0] <= w.width);
+            assert!(v.pos[2] >= 0.0 && v.pos[2] <= w.height);
+        }
+    }
+
+    /// grass placement consumes the VirtualWorld duck-type transparently:
+    /// in-bounds results are identical to the plain WorldModel path, and
+    /// building with a virtual world never panics nor exceeds the caps.
+    #[test]
+    fn grass_place_build_accepts_virtual_world() {
+        use crate::grass::place::{self, MODE_ORBIT};
+        let w = small_world();
+        let vw = alife_worldgen::VirtualWorld::wrap(&w);
+        let b = place::Builder {
+            gen: w.generation_tag,
+            cell: (4, 4),
+            mode: MODE_ORBIT,
+            focus: (300.0, 220.0),
+            lod_scale: 1.0,
+        };
+        let direct = place::build(&w, &b);
+        let virtual_ = place::build(&vw, &b);
+        assert_eq!(direct.total, virtual_.total, "in-bounds placement identical");
+        assert_eq!(direct.chunks.len(), virtual_.chunks.len());
+        for (c1, c2) in direct.chunks.iter().zip(virtual_.chunks.iter()) {
+            assert_eq!(c1.cx, c2.cx);
+            assert_eq!(c1.insts.len(), c2.insts.len());
+            for (i1, i2) in c1.insts.iter().zip(c2.insts.iter()) {
+                assert_eq!(i1.x, i2.x);
+                assert_eq!(i1.z, i2.z);
+            }
+        }
+        // edge-adjacent focus using the virtual world: robust, within budget,
+        // and vegetation now CONTINUES beyond the simulated bounds up to the
+        // streamed margin (deterministically), mirroring the terrain ring
+        let be = place::Builder {
+            gen: w.generation_tag,
+            cell: (7, 7),
+            mode: MODE_ORBIT,
+            focus: (w.width - 2.0, w.height - 2.0),
+            lod_scale: 1.0,
+        };
+        let r = place::build(&vw, &be);
+        assert!(r.total <= place::MAX_BLADES);
+        let r2 = place::build(&vw, &be);
+        for (c1, c2) in r.chunks.iter().zip(r2.chunks.iter()) {
+            assert_eq!(c1.cx, c2.cx);
+            for (i1, i2) in c1.insts.iter().zip(c2.insts.iter()) {
+                assert_eq!((i1.x, i1.z, i1.height), (i2.x, i2.z, i2.height));
+            }
+        }
+        // focus pinned at each of the four edges: clumps stream out to the
+        // margin horizon (bounded by the placement GRASS_MARGIN cap)
+        let margin = 512.0f32; // mirrors place::GRASS_MARGIN
+        let edges = [
+            (w.width - 1.0, w.height * 0.5),
+            (0.0, w.height * 0.5),
+            (w.width * 0.5, w.height - 1.0),
+            (w.width * 0.5, 0.0),
+        ];
+        let mut streamed_any = false;
+        for &(fx, fz) in &edges {
+            let bf = place::Builder {
+                gen: w.generation_tag,
+                cell: (7, 7),
+                mode: MODE_ORBIT,
+                focus: (fx, fz),
+                lod_scale: 1.0,
+            };
+            let res = place::build(&vw, &bf);
+            for c in &res.chunks {
+                for ins in &c.insts {
+                    let out_amt = (ins.x - w.width).max(-(ins.x - 0.0)).max(ins.z - w.height).max(-(ins.z)).max(0.0);
+                    assert!(out_amt <= margin, "placement beyond the margin cap: {out_amt}");
+                    if out_amt > 0.5 {
+                        streamed_any = true;
+                    }
+                }
+            }
+            assert!(res.total <= place::MAX_BLADES);
+        }
+        assert!(
+            streamed_any,
+            "vegetation must continue beyond the simulated bounds"
+        );
     }
 }

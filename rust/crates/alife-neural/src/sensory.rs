@@ -186,14 +186,53 @@ pub fn encode_into(
     encoders: &[Encoder],
 ) {
     let ch = channels(input);
+    encode_channels(cfg, &ch, dt_ms, inj, encoders);
+}
+
+/// Encode an EXPLICIT channel vector (alternate sensory mappings, e.g. the
+/// queen adapter). `chans[c]` is each channel's RAW value in its documented
+/// domain ([0,1] magnitude channels; [-1,1] signed channels); the same
+/// defensive `mapped_value` clamping applies as for the `SensoryInput`
+/// path. Deterministic.
+pub fn encode_channels(
+    cfg: &mut SensoryConfig,
+    chans: &[f32; CHANNEL_COUNT],
+    dt_ms: f32,
+    inj: &mut Vec<f32>,
+    encoders: &[Encoder],
+) {
+    encode_channels_explicit(cfg, chans, dt_ms, inj, encoders, None);
+}
+
+/// Same encoding with an OPTIONAL explicit absolute-neuron binding table
+/// (length `inputs_needed(cfg)`, one target neuron per (channel, cell)
+/// slot). `None` keeps the default contiguous layout. Each targeted neuron
+/// must be < `inj.len()` (defensively skipped otherwise). Deterministic.
+pub fn encode_channels_explicit(
+    cfg: &mut SensoryConfig,
+    chans: &[f32; CHANNEL_COUNT],
+    dt_ms: f32,
+    inj: &mut Vec<f32>,
+    encoders: &[Encoder],
+    binding: Option<&[usize]>,
+) {
     if cfg.accum.len() != cfg.channel_cells * CHANNEL_COUNT {
         cfg.accum.resize(cfg.channel_cells * CHANNEL_COUNT, 0.0);
     }
-    for (c, &val) in ch.iter().enumerate() {
+    for (c, &val) in chans.iter().enumerate() {
         let v = mapped_value(c, val);
         for k in 0..cfg.channel_cells {
             let ai = c * cfg.channel_cells + k;
-            let idx = input_neuron(cfg, c, k);
+            let idx = match binding {
+                Some(b) => {
+                    let i = b[ai];
+                    if i >= inj.len() {
+                        continue;
+                    }
+                    i
+                }
+                None => input_neuron(cfg, c, k),
+            };
             if idx >= inj.len() {
                 continue;
             }
@@ -261,3 +300,4 @@ mod tests {
         assert!(inj[22..].iter().all(|&x| x == 0.0));
     }
 }
+

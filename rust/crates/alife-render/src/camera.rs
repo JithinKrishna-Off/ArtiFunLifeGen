@@ -172,6 +172,14 @@ pub fn terrain_target_dims(
         ow *= s;
         oh *= s;
     }
+    // 64px quantization: the adaptive cost-model estimate otherwise nudges
+    // the bake dims every bake, and a differently-sized `TextureHandle::set`
+    // frees/reallocs the GPU texture per frame — an in-flight submit can then
+    // reference the destroyed texture (wgpu "texture destroyed" panic).
+    // Quantized dims keep repeated bakes same-size (pure in-place upload).
+    let q = 64.0_f32;
+    ow = (ow / q).floor().max(1.0) * q;
+    oh = (oh / q).floor().max(1.0) * q;
     // synchronous-bake cost gate; floor at 1x the source grid area — if even
     // a grid-res bake cannot make the budget, the caller still commits it on
     // a fresh view (must show *something*) and keeps it otherwise.
@@ -275,7 +283,6 @@ impl WorldView {
         if self.mode != m {
             self.mode = m;
             self.terrain_mode = m;
-            self.terrain = None;
             self.terrain_baked_frame = 0;
         }
     }
@@ -288,7 +295,6 @@ impl WorldView {
     pub fn invalidate_world(&mut self, tag: u32) {
         self.world_tag = tag;
         self.terrain_tag = tag.wrapping_sub(1);
-        self.terrain = None;
         self.terrain_baked_frame = 0;
         self.fit_pending = true;
         self.trails.clear();
@@ -466,8 +472,11 @@ impl WorldView {
             let target = self.committed_target(world, ppp);
             let est_px = target.0.max(1) as f32 * target.1.max(1) as f32;
             let est_ms = est_px / 1_000_000.0 * self.bake_cost_ms_per_mp.max(1e-4);
-            // always bake when nothing is on screen; otherwise respect budget
-            if self.terrain.is_none() || est_ms <= BAKE_MS_BUDGET {
+            // explicit user/world changes bake immediately even when the
+            // spend model recommends waiting (the stale view would show the
+            // wrong mode/world); steady-state dyn refreshes keep the budget
+            let force = mode_changed || tag_changed || key_due;
+            if force || self.terrain.is_none() || est_ms <= BAKE_MS_BUDGET {
                 let t0 = Instant::now();
                 let img = bake_terrain_scaled(
                     world,
@@ -486,14 +495,16 @@ impl WorldView {
                     self.bake_cost_ms_per_mp = (self.bake_cost_ms_per_mp * 0.65 + measured * 0.35)
                         .clamp(0.02, 400.0);
                 }
-                let name = format!("alife.terrain.{}", self.mode.label());
-                let same_name = self.terrain.as_ref().map(|t| t.name() == name) == Some(true);
-                if same_name {
-                    if let Some(mut tex) = self.terrain.take() {
-                        tex.set(img, TERRAIN_OPTIONS);
-                        self.terrain = Some(tex);
-                    }
+                // ONE persistent texture for the whole session (first bake
+                // creates it, every later bake uploads in place via `set`):
+                // dropping/reloading handles would let egui free a GPU
+                // texture while an in-flight submission still references it
+                // ("texture destroyed" panic), and renaming reallocs for the
+                // same reason. Same-handle updates never destroy.
+                if let Some(tex) = self.terrain.as_mut() {
+                    tex.set(img, TERRAIN_OPTIONS);
                 } else {
+                    let name = format!("alife.terrain.{}", self.mode.label());
                     self.terrain = Some(ctx.load_texture(&name, img, TERRAIN_OPTIONS));
                 }
                 self.bake_dims = (target.0 as u32, target.1 as u32);

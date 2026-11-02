@@ -6,7 +6,7 @@
 //! caps; the planner never reads GPU state and never allocates unboundedly.
 //! The warm path ([`Planner`]) reuses its scratch buffers every frame.
 
-use super::{BRAND_CELL, BRAND_COLONY, BRAND_FILAMENT, BRAND_FLAGELLATE};
+use super::{BRAND_CELL, BRAND_COLONY, BRAND_FILAMENT, BRAND_FLAGELLATE, BRAND_QUEEN};
 use crate::scene::OrgInst;
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
@@ -20,10 +20,91 @@ pub const QUAD_CAP: u32 = 240;
 /// instance caps (60 morphs x at most 5 sub-shells: filaments/colonies)
 pub const SHELL_CAP: u32 = 300;
 pub const TAIL_CAP: u32 = 60;
-pub const INST_CAP: usize = SHELL_CAP as usize + TAIL_CAP as usize + QUAD_CAP as usize;
+/// reserved queen slots (always full-morph, never billboards); the queen is
+/// additionally counted into MODEL_CAP when she sits inside the morph ring
+pub const QUEEN_CAP: usize = 2;
+/// queens render as a full morph at ANY range inside this hard far bound
+/// (beyond it she is simply off-camera by frustum/scan logic). Inside the
+/// ring she costs her MODEL_CAP slot; outside it she is "reduced detail"
+/// (flagged in `MorphInst.pad`), but keeps the identical queen silhouette and
+/// never merges with ordinary billboards.
+pub const QUEEN_FAR: f32 = 1600.0;
 
-/// instance record: 13 x f32 = 52 bytes, bytemuck Pod
-pub const INST_FLOATS: usize = 13;
+/// Queen template body length in RADIUS units (morph_queen: x spans
+/// [-1.67, +1.61]); crown tips reach +2.05, belly ground line ~-0.87.
+pub const QUEEN_BODY_LEN: f32 = 3.28;
+/// target visible queen body length (crown .. tail tip, world units):
+/// a ~16-unit giant against ordinary organisms re-scaled to ~1.2-1.5 units.
+pub const QUEEN_TARGET_LEN: f32 = 16.0;
+/// Ordinary (non-queen) template base body radius in world units at size 1,
+/// full turgor: the tiny re-scale (was the shared `5.5` base). The queen is
+/// DECOUPLED via [`QUEEN_UNIT_RADIUS`], so changing this never shifts her.
+/// Visible cell body length = 2 * THIS * size * turgor ~= 1.39 at size 1 /
+/// render-default turgor 0.924 (~1/12 of the queen's 16-unit body).
+pub const ORGANISM_UNIT_RADIUS: f32 = 0.75;
+/// Brand silhouette factors as fractions of [`ORGANISM_UNIT_RADIUS`] (the
+/// old brand constants were 4.6 / 3.4 / 3.0 over a 5.5 base). The flagellate
+/// factor is trimmed below the legacy 4.6/5.5 = 0.8364 ratio so its tail
+/// strand keeps the whole silhouette inside the [0.8, 2.0] length band.
+const FLAGELLATE_F: f32 = 0.62;
+const COLONY_F: f32 = 3.4 / 5.5;
+const FILAMENT_F: f32 = 3.0 / 5.5;
+/// Source-of-truth queen body radius: explicit world units, DECOUPLED from
+/// the ordinary template base so any ordinary re-scale never shifts her.
+/// Visible body length = QUEEN_BODY_LEN * THIS * size * turgor
+/// ~= [`QUEEN_TARGET_LEN`] at size 2.0 / turgor 1.0 (~14.8 at the render
+/// default turgor 0.924). BEFORE the giant rebalance the chain was
+/// `2.7 * (5.5 * size * turgor)` ~= 97 units at size 2.0 (~6x oversized for
+/// the ordinary re-scale). size/turgor dependence kept so she breathes
+/// visually. Physics/collision fields untouched.
+pub const QUEEN_UNIT_RADIUS: f32 = QUEEN_TARGET_LEN / (QUEEN_BODY_LEN * 2.0);
+/// QUEEN-only pre-pass body radius (single point shared by the planner).
+#[inline]
+pub fn queen_body_radius(size: f32, energy: f32) -> f32 {
+    QUEEN_UNIT_RADIUS * size.clamp(0.3, 2.0) * (0.62 + 0.38 * energy.clamp(0.0, 1.0))
+}
+/// Legacy mirror multiplier so consumers that mirror the shared ordinary
+/// template base (`5.5 * size * turgor * mul`) read the queen's true radius:
+/// `5.5 * QUEEN_SCALE == QUEEN_UNIT_RADIUS` exactly (= 2.44). Sent non-1.0
+/// via `OrgInst::visual_radius_mul`; pick/markers must treat any finite
+/// positive mul != 1.0 as "queen". Rebased from the pre-rebalance value
+/// 2.7 in step with the giant length retarget above.
+pub const QUEEN_SCALE: f32 = QUEEN_UNIT_RADIUS / 5.5;
+/// queen instance-origin height above terrain, in body-radius units: the
+/// template ground line (abdomen belly incl. ripple + breathe headroom)
+/// sits at local y = -0.87; lifting to 0.88*body_r seats her belly on the
+/// ground while limb stubs (-0.64) clear the terrain. Heading rotation is
+/// yaw-only (around Y), so no pitch bias is needed to keep her level.
+pub const QUEEN_GROUND_LIFT: f32 = 0.88;
+/// per-frame shortest-angle heading tracking rate (visual smoothing only)
+const QUEEN_HEADING_TURN: f32 = 0.35;
+/// queen world speed (units/s) at which the gait animation is fully engaged
+const QUEEN_GAIT_REF: f32 = 45.0;
+/// gait wave ceiling (leg/abdomen/antennae animation rate multiplier)
+const QUEEN_GAIT_MAX_WAVE: f32 = 3.6;
+/// beyond this squared per-frame jump the queen is considered teleported
+/// (heading/gait state re-initializes instead of reporting a speed spike)
+const QUEEN_TELEPORT2: f32 = 40.0 * 40.0;
+
+/// Cached per-queen visual state for heading smoothing + gait-speed
+/// estimation (visual only; never feeds sim state).
+#[derive(Clone, Copy)]
+struct QueenVis {
+    x: f32,
+    y: f32,
+    heading: f32,
+}
+
+#[inline]
+fn shortest_angle(from: f32, to: f32) -> f32 {
+    (to - from + std::f32::consts::PI).rem_euclid(TAU) - std::f32::consts::PI
+}
+
+pub const INST_CAP: usize =
+    SHELL_CAP as usize + TAIL_CAP as usize + QUAD_CAP as usize + QUEEN_CAP;
+
+/// instance record: 14 x f32 = 56 bytes, bytemuck Pod
+pub const INST_FLOATS: usize = 14;
 pub const INST_STRIDE: usize = INST_FLOATS * 4;
 
 pub const MODE_ORBIT: u8 = 0;
@@ -73,6 +154,10 @@ pub struct MorphInst {
     pub turgor: f32,
     /// animation rate multiplier (flagellar beat / membrane wobble)
     pub wave: f32,
+    /// queen LOD inside her own template family: 1.0 = full detail; 0.0 =
+    /// reduced detail beyond the 450-unit ring (limb stubs + antennae
+    /// collapsed, abdominal ridge pulse damped) while the body+crown
+    /// silhouette stays identical. Always 0.0 for non-queen instances.
     pub pad: f32,
 }
 
@@ -96,15 +181,15 @@ pub struct OrgBuild {
 
 const TAU: f32 = std::f32::consts::TAU;
 
-/// Deterministic signature of an instance: brand (2 bits) + hue bucket
-/// (8 bits) + size bucket (7 bits). Anatomy depends only on these; per-frame
-/// states (energy/age/heading/position) are applied at write time, so the
-/// decomposition itself is cacheable by this key.
+/// Deterministic signature of an instance: brand (3 bits, incl. BRAND_QUEEN)
+/// + hue bucket (8 bits) + size bucket (7 bits). Anatomy depends only on
+/// these; per-frame states (energy/age/heading/position) are applied at write
+/// time, so the decomposition itself is cacheable by this key.
 pub fn signature(o: &OrgInst) -> u64 {
-    let brand = (o.brand & 0x3) as u64;
+    let brand = (o.brand & 0x7) as u64;
     let hue_b = (o.hue.rem_euclid(1.0).max(0.0) * 256.0).floor() as u64 & 0xff;
     let size_b = (o.size.clamp(0.0, 4.0).max(0.0) * 32.0).floor() as u64 & 0x7f;
-    brand | hue_b << 2 | size_b << 10
+    brand | hue_b << 3 | size_b << 11
 }
 
 /// Species-variant anatomy knob (deterministic in the species hue, so it is
@@ -115,7 +200,9 @@ pub fn hue_variant(hue: f32, modulo: f32) -> bool {
 
 /// Decomposes an organism into template instances from snapshot fields only.
 /// Anatomy thresholds: nucleus only for large trait size > 1.1; flagella
-/// 1..2; colony sub-cells 2..3; filament segments 3..5.
+/// 1..2; colony lobes 3; filament segments 3..4. The flagellate body shell
+/// carries `flags = 10 + nucleus_gate`: frac() keeps the nucleus gate while
+/// `floor(flags / 10) == 1` codes the teardrop silhouette (WGSL, morph.rs).
 pub fn org_build(o: &OrgInst) -> OrgBuild {
     let e = o.energy.clamp(0.0, 1.0);
     let tf = 0.62 + 0.38 * e; // turgor scale: drained cells deflate to ~0.62
@@ -130,17 +217,17 @@ pub fn org_build(o: &OrgInst) -> OrgBuild {
     let mut tail = None;
     match o.brand {
         BRAND_FLAGELLATE => {
-            let r = 4.6 * size * tf;
-            shells.push(ShellSpec { off: [0.0; 3], radius: r, flags: nuc });
+            let r = ORGANISM_UNIT_RADIUS * FLAGELLATE_F * size * tf;
+            shells.push(ShellSpec { off: [0.0; 3], radius: r, flags: nuc + 10.0 });
             let tails = 1 + (hue_variant(hue, 7.0) as u32);
             tail = Some((r * 0.94, tails));
         }
         BRAND_COLONY => {
-            // fused cluster of 2-3 offset scaled cells (golden-angle ring)
-            let n = 2 + (hue_variant(hue, 5.0) as u32);
-            let r = 3.4 * size * tf;
-            for i in 0..n {
-                let a = TAU * i as f32 / n as f32 + hue * TAU;
+            // sessile 3-lobed fused cluster (golden-phase ring; lobes shrink
+            // slightly with rank; z rides a per-lobe organic sine)
+            let r = ORGANISM_UNIT_RADIUS * COLONY_F * size * tf;
+            for i in 0..3 {
+                let a = TAU * i as f32 / 3.0 + hue * TAU;
                 let d = 0.58 * r;
                 shells.push(ShellSpec {
                     off: [a.cos() * d, 0.12 * r * (2.3 * i as f32 + hue * 9.0).sin(), a.sin() * d],
@@ -150,24 +237,31 @@ pub fn org_build(o: &OrgInst) -> OrgBuild {
             }
         }
         BRAND_FILAMENT => {
-            // chain of 3-5 linked rounded segments reaching forward (+X)
-            let n = 3 + (hue_variant(hue, 3.0) as u32 + hue_variant(hue, 9.0) as u32).min(2);
+            // short linked chain of 3-4 rounded segments reaching forward
+            // (+X); offsets are expressed in segment-radius units so the
+            // beads touch/overlap like a real filament
+            let r = ORGANISM_UNIT_RADIUS * FILAMENT_F * size * tf;
+            let n = 3 + (hue_variant(hue, 3.0) as u32 + hue_variant(hue, 9.0) as u32).min(1);
             for i in 0..n {
                 let k = i as f32;
                 shells.push(ShellSpec {
                     off: [
-                        (1.4 + 4.9 * k) * size * tf,
-                        (0.9 * (1.25 * k + hue * TAU).sin()) * size * tf,
-                        (0.5 * (2.05 * k + hue * 12.3).sin()) * size * tf,
+                        r * (0.5 + 0.95 * k),
+                        r * 0.3 * (1.25 * k + hue * TAU).sin(),
+                        r * 0.1667 * (2.05 * k + hue * 12.3).sin(),
                     ],
-                    radius: 3.0 * size * tf * (1.0 - 0.06 * k),
+                    radius: r * (1.0 - 0.06 * k),
                     flags: 0.0,
                 });
             }
         }
         _ => {
             // plain cell: one soft membrane sphere (radius 1 template)
-            shells.push(ShellSpec { off: [0.0; 3], radius: 5.5 * size * tf, flags: nuc });
+            shells.push(ShellSpec {
+                off: [0.0; 3],
+                radius: ORGANISM_UNIT_RADIUS * size * tf,
+                flags: nuc,
+            });
         }
     }
     OrgBuild { shells, tail }
@@ -196,10 +290,12 @@ impl DecompCache {
 }
 
 pub struct FramePlan {
-    /// contiguous instances ordered [TAIL bucket][SHELL bucket][QUAD bucket]
+    /// contiguous instances ordered [TAIL][SHELL][QUEEN][QUAD]
     pub insts: Vec<MorphInst>,
     pub tail_n: u32,
     pub shell_n: u32,
+    /// reserved full-morph queen templates (always rendered; never billboards)
+    pub queen_n: u32,
     pub quad_n: u32,
 }
 
@@ -238,9 +334,18 @@ pub struct Planner {
     bill_scr: Vec<(f32, u32)>,
     ovf_scr: Vec<(f32, u32)>,
     cand_scr: Vec<(f32, u32)>,
+    queen_scr: Vec<(f32, u32)>,
     tails: Vec<MorphInst>,
     shells: Vec<MorphInst>,
+    queens: Vec<MorphInst>,
     quads: Vec<MorphInst>,
+    /// per-queen visual smoothing state (index = queen pre-pass slot)
+    queen_state: [Option<QueenVis>; QUEEN_CAP],
+    /// (x, z, radius, strength) trample footprint of the nearest planned
+    /// queen this frame; Some only when at least one queen rendered
+    queen_foot: Option<(f32, f32, f32, f32)>,
+    /// engine frame dt (set by the coordinator); gait speed = distance/dt
+    frame_dt: f32,
 }
 
 impl Planner {
@@ -251,16 +356,42 @@ impl Planner {
                 insts: Vec::with_capacity(INST_CAP),
                 tail_n: 0,
                 shell_n: 0,
+                queen_n: 0,
                 quad_n: 0,
             },
             morph_scr: Vec::with_capacity(MAX_ORGS_SCAN),
             bill_scr: Vec::with_capacity(MAX_ORGS_SCAN),
             ovf_scr: Vec::with_capacity(MAX_ORGS_SCAN),
             cand_scr: Vec::with_capacity(MAX_ORGS_SCAN),
+            queen_scr: Vec::with_capacity(QUEEN_CAP * 4),
             tails: Vec::with_capacity(TAIL_CAP as usize),
             shells: Vec::with_capacity(SHELL_CAP as usize),
+            queens: Vec::with_capacity(QUEEN_CAP),
             quads: Vec::with_capacity(QUAD_CAP as usize),
+            queen_state: [None, None],
+            queen_foot: None,
+            frame_dt: 1.0 / 60.0,
         }
+    }
+
+    /// Engine frame dt (seconds) used to estimate queen gait speed from her
+    /// cached position delta. Coordinator calls this once per frame before
+    /// `plan`; NaN/negative dt is ignored, the previous value (default
+    /// 1/60) stays. Visual-only.
+    pub fn set_frame_dt(&mut self, dt: f32) {
+        if dt.is_finite() && dt > 0.0 {
+            self.frame_dt = dt.min(0.25);
+        }
+    }
+
+    /// Grass-trample hook: footprint of the nearest queen planned THIS frame
+    /// as `(queen_x, queen_z, radius, strength)`. Radius ~
+    /// 0.9 * queen visual body length (~14 units) — grass inside that ring
+    /// bends away (WGSL `GrassUniform.trample`). `None` while no queen is
+    /// rendered, or between plans. The lead wires this into
+    /// `grass.rs:401` (`GrassUniform { trample: .. }` build site).
+    pub fn queen_footprint(&self) -> Option<(f32, f32, f32, f32)> {
+        self.queen_foot
     }
 
     /// Last planned frame (borrowed) — the paint path reads this between
@@ -283,8 +414,11 @@ impl Planner {
     ) -> &FramePlan {
         let (mr, qr) = (morph_radius(mode), quad_radius(mode));
         let (mr2, qr2) = (mr * mr, qr * qr);
+        let qfar2 = QUEEN_FAR * QUEEN_FAR;
+        let lod_ring2 = 450.0 * 450.0;
         self.morph_scr.clear();
         self.bill_scr.clear();
+        self.queen_scr.clear();
         for (i, o) in orgs.iter().take(MAX_ORGS_SCAN).enumerate() {
             if o.alive <= 0.0 {
                 continue; // corpses fade via `alive`; nothing visible to draw
@@ -293,6 +427,15 @@ impl Planner {
             let dz = o.y - view[2];
             let d2 = dx * dx + dz * dz;
             if !d2.is_finite() {
+                continue;
+            }
+            if o.is_queen != 0 || o.brand == BRAND_QUEEN {
+                // priority route: the queen ALWAYS renders as a full morph,
+                // never as a billboard; her slot is reserved and she never
+                // competes with the ordinary full-morph / billboard scan
+                if d2 < qfar2 {
+                    self.queen_scr.push((d2, i as u32));
+                }
                 continue;
             }
             if d2 < mr2 {
@@ -306,13 +449,91 @@ impl Planner {
         };
         self.morph_scr.sort_by(cmp);
         self.bill_scr.sort_by(cmp);
+        self.queen_scr.sort_by(cmp);
 
         self.tails.clear();
         self.shells.clear();
+        self.queens.clear();
         self.quads.clear();
+        self.queen_foot = None;
 
-        // nearest-first full-morph organisms; model cap + per-template caps
-        let mut kept = 0u32;
+        // ---- queen pre-pass (priority before the ordinary ring budget) ----
+        let mut ring_queens: u32 = 0;
+        // nearest-first; every admitted queen renders her full template. She
+        // is "reduced detail" beyond the 450-unit ring, silhouette identical.
+        for k in 0..self.queen_scr.len().min(QUEEN_CAP) {
+            let (d2, i) = self.queen_scr[k];
+            let o = &orgs[i as usize];
+            let e = o.energy.clamp(0.0, 1.0);
+            let size = o.size.clamp(0.3, 2.0);
+            let body_r = queen_body_radius(size, e);
+            let gy = height_at(o.x, o.y);
+            // seat the template ground line (QUEEN_GROUND_LIFT below the
+            // origin) on the terrain: queen world Y always touches the
+            // ground here — ordinates of the lobes cancel out along yaw
+            let base = [o.x, gy + body_r * QUEEN_GROUND_LIFT, o.y];
+            if !visible(base, body_r * 2.0) {
+                continue;
+            }
+            // visual heading smoothing + gait speed (cached position delta;
+            // position jumps beyond QUEEN_TELEPORT2 reset the state)
+            let mut heading = o.heading;
+            let mut gait01 = 0.0f32;
+            {
+                let mut st = self.queen_state[k].take();
+                let continuous = st
+                    .filter(|s| {
+                        let dx = o.x - s.x;
+                        let dz = o.y - s.y;
+                        dx * dx + dz * dz < QUEEN_TELEPORT2
+                    })
+                    .is_some();
+                if let Some(s) = st.as_mut() {
+                    if continuous {
+                        // shortest-angle chase toward the engine heading
+                        s.heading += shortest_angle(s.heading, o.heading) * QUEEN_HEADING_TURN;
+                        heading = s.heading;
+                        let dx = o.x - s.x;
+                        let dz = o.y - s.y;
+                        let speed = (dx * dx + dz * dz).sqrt() / self.frame_dt;
+                        gait01 = (speed / QUEEN_GAIT_REF).clamp(0.0, 1.0);
+                        s.x = o.x;
+                        s.y = o.y;
+                    }
+                }
+                if !continuous {
+                    st = Some(QueenVis { x: o.x, y: o.y, heading: o.heading });
+                }
+                self.queen_state[k] = st;
+            }
+            let own_phase = inst_phase(o.hue) + (o.x * 0.031 + o.y * 0.017); // per-id desync
+            let wave = (1.1 + 0.5 * e + 2.5 * gait01).min(QUEEN_GAIT_MAX_WAVE);
+            self.queens.push(MorphInst {
+                pos_x: base[0], pos_y: base[1], pos_z: base[2],
+                heading,
+                radius: body_r,
+                breathe: 0.05 + 0.03 * (1.0 - e),
+                hue: o.hue.rem_euclid(1.0),
+                age: o.age.clamp(0.0, 1.0),
+                alpha: o.alive.clamp(0.0, 1.0),
+                flags: 0.0,
+                phase: own_phase,
+                turgor: 0.35 + 0.65 * e,
+                wave, // idle pulse scaled up with movement (gait speed)
+                pad: if d2 < lod_ring2 { 1.0 } else { 0.0 },
+            });
+            // grass-trample footprint of the nearest on-screen queen
+            if self.queen_foot.is_none() {
+                let vlen = QUEEN_BODY_LEN * body_r;
+                self.queen_foot = Some((o.x, o.y, 0.9 * vlen, 1.0));
+            }
+            // honesty about the shared budget: inside the morph ring she
+            // consumes one of the MODEL_CAP full-morph organism slots
+            if d2 < mr2 {
+                ring_queens += 1;
+            }
+        }
+        let mut kept = ring_queens;
         self.ovf_scr.clear();
         for k in 0..self.morph_scr.len() {
             let (d2, i) = self.morph_scr[k];
@@ -391,7 +612,7 @@ impl Planner {
             }
             let o = &orgs[i as usize];
             let e = o.energy.clamp(0.0, 1.0);
-            let radius = 5.5 * o.size.clamp(0.3, 2.0) * (0.62 + 0.38 * e);
+            let radius = ORGANISM_UNIT_RADIUS * o.size.clamp(0.3, 2.0) * (0.62 + 0.38 * e);
             let d = d2.sqrt();
             // fade begins ~92% of the morph ring, gone by the outer ring
             let fade = (1.0 - (d - mr * 0.92) / (qr - mr * 0.92)).clamp(0.0, 1.0);
@@ -416,18 +637,21 @@ impl Planner {
             });
         }
 
-        // assemble the contiguous draw ranges: [tails][shells][billboards]
+        // assemble the contiguous draw ranges: [tails][shells][queens][billboards]
         let tail_n = self.tails.len() as u32;
         let shell_n = self.shells.len() as u32;
+        let queen_n = self.queens.len() as u32;
         self.out.insts.clear();
         self.out.insts.extend_from_slice(&self.tails);
         self.out.insts.extend_from_slice(&self.shells);
+        self.out.insts.extend_from_slice(&self.queens);
         self.out.insts.extend_from_slice(&self.quads);
         self.out.tail_n = tail_n;
         self.out.shell_n = shell_n;
+        self.out.queen_n = queen_n;
         self.out.quad_n = self.quads.len() as u32;
         debug_assert_eq!(
-            (tail_n + shell_n + self.out.quad_n) as usize,
+            (tail_n + shell_n + queen_n + self.out.quad_n) as usize,
             self.out.insts.len()
         );
         debug_assert!(self.out.insts.len() <= INST_CAP);
@@ -450,6 +674,7 @@ pub fn plan_frame(
         insts: n.insts.clone(),
         tail_n: n.tail_n,
         shell_n: n.shell_n,
+        queen_n: n.queen_n,
         quad_n: n.quad_n,
     }
 }

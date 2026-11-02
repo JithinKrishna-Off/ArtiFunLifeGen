@@ -8,8 +8,22 @@
 //! never depends on frame rate.
 
 pub mod edit;
+pub mod ecology;
+pub mod queen;
+pub mod queen_bridge;
+pub mod signals;
 pub mod spatial;
 pub mod weather;
+
+pub use queen::{
+    NeuralTickBudget, QueenBrain, QueenBrainFactory, QueenBrainSnapshot, QueenBrainStats,
+    QueenConfig, QueenDeath, QueenEvent, QueenEventKind, QueenSnapshot, QueenState,
+    SensoryInputForQueen, QUEEN_ACTIVITY_KIND,
+};
+
+/// The real signal field (Agent 7's module; API superset of the old
+/// fallback: new/emit/tick/sample/active_mass used by the engine).
+pub use signals::SignalField as QueenSignalField;
 
 pub use weather::{
     EffectKind, FertBoost, RegionEffect, WeatherState, BOLTS_CAP, BOOSTS_CAP, EFFECTS_CAP,
@@ -25,6 +39,7 @@ use alife_common::{
 use alife_evo::{genotype_distance, mutate_genotype, random_genotype, think};
 use alife_worldgen::WorldModel;
 use edit::EditEntry;
+use ecology::{EcologyConfig, EcologyState};
 use serde::{Deserialize, Serialize};
 use spatial::SpatialGrid;
 use std::collections::{HashMap, HashSet};
@@ -54,6 +69,11 @@ const EDIT_STACK_CAP: usize = 256;
 const REDO_STACK_CAP: usize = 64;
 /// Share of food_regen_per_sec that patches receive, scaled by richness.
 const PATCH_REGEN_SHARE: f32 = 0.5;
+/// Signal/food field tick rate (Hz) in sim time and the per-tick dt.
+const FIELD_HZ: f32 = 4.0;
+const FIELD_TICK_DT: f32 = 1.0 / FIELD_HZ;
+/// Field accumulator never banks more than a couple of ticks of catch-up.
+const FIELD_ACC_CAP: f32 = 2.0 * FIELD_TICK_DT;
 /// Fractional food budget never carries more than a few items across steps.
 const FOOD_ACC_CAP: f32 = 4.0;
 /// Weather tick interval in steps (default 60 = 1 sim-second).
@@ -87,6 +107,9 @@ const GLOBAL_DROUGHT_STEPS: u64 = 10800;
 const HAZARD_CLASSIFY_MIN: f32 = 3.0;
 /// Initial food seeding budget = INITIAL_SEED_MULTIPLE x initial_food attempts.
 const INITIAL_SEED_MULTIPLE: u32 = 3;
+/// Organism signal sensing: max contribution of the QueenActivity sample to
+/// the food-intensity input slot (blend; slot count unchanged).
+const SIGNAL_SENSE_BLEND: f32 = 0.25;
 
 /// Complete engine snapshot for exact save/restore. All fields are required
 /// on restore; the persistence layer serializes this whole struct.
@@ -129,6 +152,13 @@ pub struct SaveCore {
     pub hazard_window: u32,
     /// weather cadence configured for this run
     pub weather_every: u32,
+    /// v2 queen state (additive; older v2 saves without this / null load as None)
+    #[serde(default)]
+    pub queen: Option<queen::QueenSnapshot>,
+    /// v2 ecology layer state (additive; pre-ecology saves load the default
+    /// config/state — `EcologySave` is fully serde-defaulted)
+    #[serde(default)]
+    pub ecology: ecology::EcologySave,
 }
 
 /// Stable read/step API consumed by UI, renderer and app.
@@ -209,6 +239,10 @@ pub struct Simulation {
     pending_deaths: Vec<DeathEvent>,
     // per-step energy ledger (reset at the top of every advance)
     step_gain: f64,
+    /// threat-closure memory for the queen's brain senses (not saved state:
+    /// a restored brain re-measures from rest, so the rate just starts at 0)
+    queen_prev_hazard: f32,
+    queen_prev_hazard_step: u64,
     step_drain: f64,
     step_birth_cost: f64,
     step_birth_credit: f64,
@@ -233,6 +267,30 @@ pub struct Simulation {
     starve_ring: Vec<u32>,
     age_ring: Vec<u32>,
     hazard_ring: Vec<u32>,
+    // ---------------------------------------------------------- queen layer
+    /// signal field (fallback module until Agent 7's SignalField lands — see
+    /// `queen::` todo note). Ticks at FIELD_HZ inside `advance()`.
+    pub signals: QueenSignalField,
+    /// 4 Hz accumulator for `signals.tick`
+    field_acc: f32,
+    /// single queen slot (see `queen::QueenState`)
+    queen: QueenState,
+    queen_events: Vec<queen::QueenEvent>,
+    queen_config: queen::QueenConfig,
+    /// optional factory rehydrating a saved queen brain on load
+    queen_brain_factory: Option<Box<dyn queen::QueenBrainFactory>>,
+    /// transient: the LAST brain motor output from `queen_step_brain`,
+    /// consumed by `update_one` when steering the queen (never persisted;
+    /// zeroed = no brain / no motor).
+    last_queen_motor: queen::QueenMotorOut,
+    /// ecology layer (energy modulation of existing food items, ~4 Hz)
+    pub ecology: EcologyState,
+    /// deterministic splitmix64 seed-state for the ecology tick
+    ecology_rng: u64,
+    // per-advance compute report accumulators (reset by compute_report())
+    rep_sim_ns: u64,
+    rep_queen_brain_ns: u64,
+    rep_field_ns: u64,
 }
 
 impl Simulation {
@@ -261,6 +319,8 @@ impl Simulation {
     }
 
     fn blank(params: &SimParams, world: WorldModel) -> Simulation {
+        let ww = world.width;
+        let wh = world.height;
         Self {
             params: params.clone(),
             edits: EnvironmentEdits::default(),
@@ -294,6 +354,8 @@ impl Simulation {
             protected: Vec::new(),
             pending_deaths: Vec::new(),
             step_gain: 0.0,
+            queen_prev_hazard: 0.0,
+            queen_prev_hazard_step: 0,
             step_drain: 0.0,
             step_birth_cost: 0.0,
             step_birth_credit: 0.0,
@@ -315,6 +377,18 @@ impl Simulation {
             starve_ring: vec![0; WINDOW_LEN],
             age_ring: vec![0; WINDOW_LEN],
             hazard_ring: vec![0; WINDOW_LEN],
+            signals: QueenSignalField::new(ww, wh, 64),
+            field_acc: 0.0,
+            queen: QueenState::default(),
+            queen_events: Vec::new(),
+            queen_config: QueenConfig::default(),
+            queen_brain_factory: None,
+            last_queen_motor: queen::QueenMotorOut::default(),
+            ecology: EcologyState::new(EcologyConfig::default()),
+            ecology_rng: (params.seed as u64) | 1,
+            rep_sim_ns: 0,
+            rep_queen_brain_ns: 0,
+            rep_field_ns: 0,
             world,
         }
     }
@@ -331,6 +405,7 @@ impl Simulation {
     /// simply call this more often per wall-second (weather ticks stay in
     /// sim-time and catch up at most `MAX_DT` seconds after a skip).
     pub fn advance(&mut self) -> StepEvents {
+        let t_sim = std::time::Instant::now();
         self.step_count += 1;
         let dt = DT;
         let mut events = StepEvents::default();
@@ -347,10 +422,45 @@ impl Simulation {
         // weather ticks in sim-time (see weather_tick)
         self.weather_tick(dt);
 
+        // signal field ticks at FIELD_HZ in sim time (bounded catch-up).
+        // The ecology layer runs INSIDE the same bounded loop (documented
+        // cadence: ~4 Hz, always accompanies a field tick). It NEVER creates
+        // or removes food — the engine's per-step `regen_food(dt)` spawn
+        // budget is untouched and there is NO double regrowth: ecology only
+        // modulates the ENERGY of items the engine already spawned.
+        self.field_acc = (self.field_acc + dt).min(FIELD_ACC_CAP);
+        let t_field = std::time::Instant::now();
+        while self.field_acc >= FIELD_TICK_DT {
+            self.field_acc -= FIELD_TICK_DT;
+            self.signals.tick(FIELD_TICK_DT);
+            // queen-activity coupling: bias regrowth by the kind-4 sample at
+            // the queen's broadcast point (neutral world center otherwise)
+            let (sx, sy) = if self.queen.alive {
+                self.organisms
+                    .iter()
+                    .find(|o| o.alive && o.id == self.queen.org_id as u64)
+                    .map(|o| (o.x, o.y))
+                    .unwrap_or((self.world.width * 0.5, self.world.height * 0.5))
+            } else {
+                (self.world.width * 0.5, self.world.height * 0.5)
+            };
+            let s4 = self.signals.sample(queen::QUEEN_ACTIVITY_KIND, sx, sy);
+            let bias = EcologyState::regrow_bias_from_signal(s4);
+            self.ecology
+                .tick(&self.world, &mut self.foods, FIELD_TICK_DT, &mut self.ecology_rng, bias);
+        }
+        self.rep_field_ns += t_field.elapsed().as_nanos() as u64;
+
         // deaths deferred from interventions (purges) are surfaced here
         if !self.pending_deaths.is_empty() {
             events.deaths.extend(self.pending_deaths.drain(..));
         }
+
+        // Queen brain: senses from the SAME pre-move sensory context the
+        // ordinary net uses (documented ordering: brain ticks BEFORE body
+        // updates; the motor output is applied to her movement slots so the
+        // ordinary `update_one` actuation/bounds/obstacle/eating path fires).
+        self.queen_step_brain();
 
         for i in 0..self.organisms.len() {
             self.update_one(i, dt);
@@ -368,15 +478,26 @@ impl Simulation {
         // Two in-place passes over the SAME Vec (capacity preserved, no
         // per-step reallocation): classify first, then compact survivors.
         let step = self.step_count;
+        let queen_id64 = if self.queen.alive { Some(self.queen.org_id as u64) } else { None };
         self.scratch_dead.clear();
         for (i, o) in self.organisms.iter().enumerate() {
+            // QUEEN LIFECYCLE RULE: she is the one immortal organism. She
+            // never dies biologically — starvation, ageing and hazard still
+            // hit her ENERGY (she can be drained to zero and recover via the
+            // survival floor), but no death cause is ever produced for her
+            // and she is never removed by the ordinary lifecycle. God
+            // interventions respect the same rule (see PurgeLineage/meteor).
+            if Some(o.id) == queen_id64 {
+                continue;
+            }
+            let life = o.genotype.traits.lifespan;
             let cause = if !o.energy.is_finite() || o.energy <= 0.0 {
                 if self.hazard_pressure(o.x, o.y) >= HAZARD_CLASSIFY_MIN {
                     Some(DeathCause::Hazard)
                 } else {
                     Some(DeathCause::Starvation)
                 }
-            } else if o.age >= o.genotype.traits.lifespan {
+            } else if o.age >= life {
                 Some(DeathCause::OldAge)
             } else {
                 None
@@ -435,6 +556,10 @@ impl Simulation {
         self.total_age += age_n as u64;
         self.total_hazard += hazard_n as u64;
 
+        // queen bookkeeping: death detection (covers purge/meteor removals
+        // which surface here as deferred deaths) + energy-history ring
+        self.queen_post_step(&events.deaths);
+
         // food upkeep
         self.foods.retain(|f| f.alive);
         self.regen_food(dt);
@@ -452,7 +577,353 @@ impl Simulation {
         Self::roll_window(&mut self.hazard_ring, &mut self.hazard_window, hazard_n, widx);
 
         self.refresh_stats();
+        self.rep_sim_ns += t_sim.elapsed().as_nanos() as u64;
         events
+    }
+
+    // -------------------------------------------------------------- queen api
+
+    /// Crowns `org_id` as queen (vectors 0.2). Only ALIVE ids accepted; there
+    /// is no respawn on death. Returns false when the id is unknown/dead or
+    /// she is already crowned with that id.
+    pub fn crown_queen(&mut self, org_id: u64) -> bool {
+        let alive = self
+            .organisms
+            .iter()
+            .any(|o| o.id == org_id && o.alive);
+        if !alive {
+            return false;
+        }
+        let id32 = org_id as u32;
+        if self.queen.alive && self.queen.org_id == id32 {
+            return false;
+        }
+        self.queen = QueenState {
+            alive: true,
+            org_id: id32,
+            crowned_tick: self.step_count,
+            death_cause: None,
+            brain: None,
+            energy_history: Vec::new(),
+            brain_ticks: 0,
+            brain_restore_failed: false,
+            reclaim_brain: None,
+        };
+        self.queen_events.push(queen::QueenEvent {
+            tick: self.step_count,
+            kind: queen::QueenEventKind::Crowned,
+            org_id: id32,
+        });
+        queen::trim_events(&mut self.queen_events);
+        true
+    }
+
+    /// Current queen organism id, if she is alive.
+    pub fn queen_id(&self) -> Option<u32> {
+        if self.queen.alive {
+            Some(self.queen.org_id)
+        } else {
+            None
+        }
+    }
+
+    /// Renderer/UI flag helper: is this organism the living queen.
+    pub fn is_queen(&self, id: u64) -> bool {
+        self.queen.alive && self.queen.org_id as u64 == id
+    }
+
+    /// Bounded queen event ring (<= 64, oldest dropped).
+    pub fn queen_events(&self) -> &[queen::QueenEvent] {
+        &self.queen_events
+    }
+
+    pub fn queen_config(&self) -> queen::QueenConfig {
+        self.queen_config
+    }
+
+    pub fn set_queen_config(&mut self, c: queen::QueenConfig) {
+        self.queen_config = c;
+    }
+
+    /// Plugs a queen brain (set to None to run the default net only).
+    pub fn set_queen_brain(&mut self, brain: Option<Box<dyn queen::QueenBrain>>) {
+        self.queen.brain = brain;
+    }
+
+    /// Registers the factory used to rehydrate a saved queen brain on load.
+    /// If the sim holds a restored queen whose brain bytes could not be
+    /// rehydrated yet (factory was registered too late, e.g. the UI loads
+    /// its artifact AFTER the save), the snapshot bytes are attempted once
+    /// here — honest success (brain plugs, flag clears) or honest failure
+    /// (flag stays true).
+    pub fn set_queen_brain_factory(&mut self, f: Option<Box<dyn queen::QueenBrainFactory>>) {
+        self.queen_brain_factory = f;
+        if self.queen.alive && self.queen.brain.is_none() {
+            if let Some(snap) = self.queen.reclaim_brain.take() {
+                let built = self.build_brain_from(&snap);
+                if let Some(b) = built {
+                    self.queen.brain = Some(b);
+                    self.queen.brain_restore_failed = false;
+                } else {
+                    self.queen.brain_restore_failed = true;
+                }
+            }
+        }
+    }
+
+    /// Honest factory-driven rehydration of a serde brain snapshot: builds
+    /// through the registered factory and restores the bytes. `None` when no
+    /// factory is registered or the bytes do not round-trip.
+    fn build_brain_from(
+        &mut self,
+        snap: &queen::QueenBrainSnapshot,
+    ) -> Option<Box<dyn queen::QueenBrain>> {
+        let mut b = self.queen_brain_factory.as_ref()?.build();
+        if b.restore(&snap.bytes) {
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+
+    /// Additive accessor: the last `from_save_core` could not rebuild the
+    /// saved queen brain (factory missing or snapshot bytes unusable). Such
+    /// a queen loads alive, honestly WITHOUT a brain (driven by her evolved
+    /// net) — never a panic, never a synthetic fixture pretending to be the
+    /// real subnetwork.
+pub fn queen_brain_restore_failed(&self) -> bool {
+        self.queen.brain_restore_failed
+    }
+
+    /// Cheap brain counters for compute report / UI (None = no brain plugged).
+    pub fn queen_brain_stats(&self) -> Option<queen::QueenBrainStats> {
+        self.queen.brain.as_ref().map(|b| b.stats())
+    }
+
+    pub fn queen_reign_step(&self) -> u64 {
+        if self.queen.alive {
+            self.step_count.saturating_sub(self.queen.crowned_tick)
+        } else {
+            0
+        }
+    }
+
+    /// Per-move queen bookkeeping after body updates + death compaction:
+    /// detects her death (covers purge/meteor removals surfaced as deferred
+    /// deaths), records `Died(..)` events, and keeps the energy-fraction ring.
+    fn queen_post_step(&mut self, deaths: &[DeathEvent]) {
+        if self.queen.alive {
+            for d in deaths {
+                if d.id as u32 == self.queen.org_id {
+                    self.queen.alive = false;
+                    self.queen.death_cause = Some(QueenDeath::from(d.cause));
+                    self.queen.brain = None;
+                    self.queen_events.push(queen::QueenEvent {
+                        tick: self.step_count,
+                        kind: queen::QueenEventKind::Died(QueenDeath::from(d.cause)),
+                        org_id: self.queen.org_id,
+                    });
+                    queen::trim_events(&mut self.queen_events);
+                    break;
+                }
+            }
+        }
+        // energy-history ring while she is alive
+        if self.queen.alive {
+            if let Some(o) = self
+                .organisms
+                .iter()
+                .find(|o| o.id == self.queen.org_id as u64 && o.alive)
+            {
+                self.queen.push_energy_frac(o.energy / o.max_energy.max(1.0));
+            }
+        }
+    }
+
+    /// Additive save payload for `SaveCore.queen`.
+    /// One queen-brain tick burst per advance, before body updates:
+    /// samples the kind-4 field at her position, builds the queen senses
+    /// from the ordinary sense_* context, ticks the brain under the
+    /// configured budget, applies the motor output to her movement path,
+    /// and surfaces `emit_signal` as a kind-4 emission + documented energy
+    /// cost. Paused (budget 0) is legal: the bridge persists the last
+    /// output, which is then applied unchanged.
+    fn queen_step_brain(&mut self) {
+        if !self.queen.alive || self.queen.brain.is_none() {
+            return;
+        }
+        let idx = match self
+            .organisms
+            .iter()
+            .position(|o| o.alive && o.id == self.queen.org_id as u64)
+        {
+            Some(i) => i,
+            None => return,
+        };
+        // kind-4 = QueenActivity; the queen also senses her own emissions —
+        // documented (the field is her broadcast medium, sample first so the
+        // tick-later emission of THIS advance is not echoed into her senses)
+        let (qx, qy) = { let o = &self.organisms[idx]; (o.x, o.y) };
+        let sig_sample = self.signals.sample(queen::QUEEN_ACTIVITY_KIND, qx, qy);
+        let senses = self.brain_senses(idx, sig_sample);
+        let budget = queen::NeuralTickBudget {
+            max_ticks_per_advance: self.queen_config.brain_ticks_per_advance,
+        };
+        let t0 = std::time::Instant::now();
+        let motor = {
+            let Some(b) = self.queen.brain.as_mut() else { return };
+            b.tick(&senses, &budget)
+        };
+        // honest measured wall cost of the tick burst (compute report)
+        self.rep_queen_brain_ns += t0.elapsed().as_nanos() as u64;
+        self.queen.brain_ticks += budget.max_ticks_per_advance as u64;
+        self.last_queen_motor = motor;
+        self.apply_queen_motor(idx, &motor, &senses);
+        // emission -> kind 4 at her position + energy cost, ledger-visible
+        let emit = motor.emit_signal.clamp(0.0, 1.0);
+        if emit > 0.0 {
+            self.signals.emit(queen::QUEEN_ACTIVITY_KIND, qx, qy, emit);
+            let cost = self.queen_config.signal_emit_cost.max(0.0)
+                * emit
+                * self.params.food_energy.max(1.0);
+            if cost > 0.0 {
+                let o = &mut self.organisms[idx];
+                o.energy = (o.energy - cost).max(0.0);
+                self.step_drain += cost as f64;
+            }
+        }
+    }
+
+    /// Queen sensory snapshot — documented reuse: the SAME sense_food /
+    /// sense_peers / sense_hazard context the ordinary 11-input net gets,
+    /// plus the caller-provided kind-4 signal sample, heading and normalized
+    /// edge distance. `speed` is normalized by her body max speed (bridge
+    /// contract keeps everything in [0, 1]).
+    fn brain_senses(&mut self, i: usize, signal_sample: f32) -> queen::SensoryInputForQueen {
+        let (px, py, dir, spd, energy, max_e, traits, alive) = {
+            let o = &self.organisms[i];
+            (o.x, o.y, o.dir, o.speed, o.energy, o.max_energy, o.genotype.traits, o.alive)
+        };
+        if !alive {
+            return queen::SensoryInputForQueen::default();
+        }
+        let mut inp = [0.0f32; NET_INPUTS];
+        let food = self.sense_food(px, py, dir, &traits, &mut inp);
+        self.sense_peers(i, px, py, dir, &traits, &mut inp);
+        let hazard_grad = self.sense_hazard(px, py, dir, &mut inp);
+        // threat approach rate: closure of the normalized hazard pressure
+        // between consecutive brain samples (transient, remembered between
+        // advances; a restored brain starts measuring from rest = 0)
+        let h_now = inp[6];
+        let hazard_rate = {
+            let delta = h_now - self.queen_prev_hazard;
+            let dstep = self.step_count.saturating_sub(self.queen_prev_hazard_step).max(1);
+            (delta / (dstep as f32 / 60.0)).clamp(0.0, 1.0)
+        };
+        self.queen_prev_hazard = h_now;
+        self.queen_prev_hazard_step = self.step_count;
+        let food_dir = match food {
+            Some((dx, dy, _)) => {
+                let m = (dx * dx + dy * dy).sqrt();
+                if m > 1e-6 {
+                    (dx / m, dy / m)
+                } else {
+                    (0.0, 0.0)
+                }
+            }
+            None => (0.0, 0.0),
+        };
+        let edge = if self.params.wrapping {
+            1.0 // no reachable edge in a wrap-connected world
+        } else {
+            let w = self.world.width.max(1.0);
+            let h = self.world.height.max(1.0);
+            let d = px.min(w - px).min(py.min(h - py)).max(0.0);
+            (d / (w.max(h) * 0.5)).clamp(0.0, 1.0)
+        };
+        queen::SensoryInputForQueen {
+            food_dir,
+            food_dist: food.map(|(_, _, d)| d).unwrap_or(f32::INFINITY),
+            heading: wrap_pi(if dir.is_finite() { dir } else { 0.0 }),
+            speed: (spd / traits.max_speed.max(1e-6)).clamp(0.0, 1.0),
+            energy_frac: ((energy / max_e.max(1.0)) as f32)
+                .clamp(0.0, 1.0),
+            hazard: inp[6],
+            edge_dist: edge,
+            signal_sample: if signal_sample.is_finite() { signal_sample.clamp(0.0, 1.0) } else { 0.0 },
+            density: inp[5],
+            hazard_dir: hazard_grad,
+            hazard_rate,
+        }
+    }
+
+        /// Applies the brain motor output to the queen's body slots so the
+    /// ordinary `update_one` actuation integrates it (documented ordering:
+    /// this PRE-steer happens BEFORE update_one, which then applies the
+    /// brain-recorded turn at the standard 0.12 rad/step and smooths thrust
+    /// toward `move_intensity * max_speed`):
+    /// - heading pulled toward the brain's desired world direction
+    ///   (`move_dir`) proportionally to `move_intensity`;
+    /// - `feed_seek` pulls her toward the nearest food exactly analog to the
+    ///   ordinary food-driven steering (same 0.12 rad/step constant);
+    /// - `turn` / `move_intensity` / `feed_seek` are recorded into
+    ///   `last_outputs[0..3]` (slots of the ordinary net contract: turn,
+    ///   thrust, repro-gate — the brain-steered queen's slot 2 route to
+    ///   reproduction is declined separately in `try_reproduce`).
+    fn apply_queen_motor(
+        &mut self,
+        idx: usize,
+        motor: &queen::QueenMotorOut,
+        senses: &queen::SensoryInputForQueen,
+    ) {
+        const QUEEN_STEER_RATE: f32 = 0.35; // world-dir pull per step
+        const QUEEN_FEED_TURN: f32 = 0.12; // same constant as the net mapping
+        let dir = { let o = &self.organisms[idx]; o.dir };
+        let di = motor.move_intensity.clamp(0.0, 1.0);
+        let fs = motor.feed_seek.clamp(0.0, 1.0);
+        let mut steer = 0.0f32;
+        let md_m = motor.move_dir.0.hypot(motor.move_dir.1);
+        if md_m > 1e-6 && motor.move_dir.0.is_finite() && motor.move_dir.1.is_finite() {
+            let desired = motor.move_dir.1.atan2(motor.move_dir.0);
+            steer += wrap_pi(desired - dir) * di * QUEEN_STEER_RATE;
+        }
+        // nearest-food pull (world-frame unit dir from the shared senses)
+        let (fdx, fdy) = senses.food_dir;
+        if (fdx != 0.0 || fdy != 0.0) && fdx.is_finite() && fdy.is_finite() {
+            let rel = wrap_pi(fdy.atan2(fdx) - dir);
+            steer += rel * fs * QUEEN_FEED_TURN;
+        }
+        let o = &mut self.organisms[idx];
+        o.dir = wrap_pi(dir + steer);
+        if o.last_outputs.len() == NET_OUTPUTS {
+            o.last_outputs[0] = motor.turn.clamp(-1.0, 1.0);
+            o.last_outputs[1] = di;
+            o.last_outputs[2] = fs;
+        }
+    }
+
+    /// Additive save payload for `SaveCore.queen`.
+    fn queen_snapshot(&self) -> Option<queen::QueenSnapshot> {
+        if !self.queen.alive && self.queen.org_id == 0 {
+            return None;
+        }
+        let brain = self.queen.brain.as_ref().map(|b| queen::QueenBrainSnapshot {
+            identity: b.identity(),
+            stats: b.stats(),
+            bytes: b.snapshot(),
+        });
+        Some(queen::QueenSnapshot {
+            alive: self.queen.alive,
+            org_id: self.queen.org_id,
+            crowned_tick: self.queen.crowned_tick,
+            death_cause: self.queen.death_cause,
+            energy_history: self.queen.energy_history.clone(),
+            brain_ticks: self.queen.brain_ticks,
+            events: self.queen_events.clone(),
+            config: self.queen_config,
+            brain,
+        })
     }
 
     fn rebuild_grids(&mut self) {
@@ -492,9 +963,21 @@ impl Simulation {
 
         // sensors, filled in INPUT_LABELS order, normalized to [-1, 1]
         let mut inp = [0.0f32; NET_INPUTS];
-        self.sense_food(px, py, dir, &traits, &mut inp);
+        let _ = self.sense_food(px, py, dir, &traits, &mut inp);
         self.sense_peers(i, px, py, dir, &traits, &mut inp);
-        self.sense_hazard(px, py, dir, &mut inp);
+        let _ = self.sense_hazard(px, py, dir, &mut inp);
+        // ambient signal blend (documented slot: food-intensity slot 2; the
+        // 11-input count stays UNBROKEN — no slot is added, and existing
+        // genotypes/saves just get a mildly modulated food intensity).
+        // Blend strength: up to SIGNAL_SENSE_BLEND of the QueenActivity
+        // sample at this organism's position.
+        {
+            let s = self.signals.sample(queen::QUEEN_ACTIVITY_KIND, px, py);
+            if s.is_finite() {
+                let bl = inp[2] + SIGNAL_SENSE_BLEND * s.clamp(0.0, 1.0);
+                inp[2] = bl.clamp(0.0, 1.0);
+            }
+        }
         inp[9] = ((energy / max_e.max(1.0)) * 2.0 - 1.0).clamp(-1.0, 1.0);
         let lifespan = traits.lifespan.max(1) as f32;
         inp[10] = ((age as f32 / lifespan) * 2.0 - 1.0).clamp(-1.0, 1.0);
@@ -504,24 +987,26 @@ impl Simulation {
             }
         }
 
-        // controller: fill last_inputs / last_outputs, run the network
-        {
-            let li = &mut self.organisms[i].last_inputs;
-            if li.len() != NET_INPUTS {
-                li.clear();
-                li.resize(NET_INPUTS, 0.0);
-            }
-            let lo = &mut self.organisms[i].last_outputs;
-            if lo.len() != NET_OUTPUTS {
-                lo.clear();
-                lo.resize(NET_OUTPUTS, 0.0);
-            }
-        }
+        // controller: fill last_inputs / last_outputs, run the network.
+        // The queen WITH a plugged brain skips the evolved net: her
+        // motor comes from `queen_step_brain` (documented ordering: brain
+        // ticks BEFORE update_one; the recorded turn / thrust / feed_seek
+        // slots are applied through the ordinary actuation below).
+        let queen_brain_steer = self.queen.alive
+            && self.queen.brain.is_some()
+            && self.organisms[i].id == self.queen.org_id as u64;
         let mut out = [0.0f32; NET_OUTPUTS];
         {
             let o = &mut self.organisms[i];
             o.last_inputs.copy_from_slice(&inp);
-            think(&o.genotype.net, &inp, &mut out);
+            if queen_brain_steer {
+                let m = self.last_queen_motor;
+                out[0] = m.turn.clamp(-1.0, 1.0);
+                out[1] = m.move_intensity.clamp(0.0, 1.0);
+                out[2] = m.feed_seek.clamp(0.0, 1.0);
+            } else {
+                think(&o.genotype.net, &inp, &mut out);
+            }
         }
         for v in out.iter_mut() {
             if !v.is_finite() {
@@ -576,7 +1061,7 @@ impl Simulation {
         dir: f32,
         t: &alife_common::Traits,
         inp: &mut [f32; NET_INPUTS],
-    ) {
+    ) -> Option<(f32, f32, f32)> {
         let search = (t.sensor_range * 1.5).max(1.0);
         self.food_grid.query_into(px, py, search, &mut self.scratch_food);
         let mut best: Option<(f32, f32, f32)> = None; // (dx, dy, energy)
@@ -606,7 +1091,9 @@ impl Simulation {
             let factor =
                 ((energy / self.params.food_energy.max(1.0)).clamp(0.0, 2.0) * 0.5).clamp(0.0, 1.0);
             inp[2] = (1.0 / (1.0 + d / 120.0)) * factor;
+            return Some((dx, dy, d));
         }
+        None
     }
 
     fn sense_peers(
@@ -655,7 +1142,7 @@ impl Simulation {
         if v.is_finite() { v.clamp(0.0, 2.0) } else { 0.0 }
     }
 
-    fn sense_hazard(&self, px: f32, py: f32, dir: f32, inp: &mut [f32; NET_INPUTS]) {
+    fn sense_hazard(&self, px: f32, py: f32, dir: f32, inp: &mut [f32; NET_INPUTS]) -> (f32, f32) {
         let h = self.hsample(px, py);
         inp[6] = (h * 2.0).clamp(0.0, 1.0);
         // hazard "up-gradient": samples at +/- 8 units on both axes
@@ -663,9 +1150,15 @@ impl Simulation {
         let gy = self.hsample(px, py + 8.0) - self.hsample(px, py - 8.0);
         let gmag = (gx * gx + gy * gy).sqrt();
         if gmag > 1e-4 {
+            // relative (net-input frame) AND world-frame direction returned:
+            // the world vector is what the queen brain's threat-direction
+            // channels consume (documented: hazard gradient = threat direction)
             let rel = wrap_pi(gy.atan2(gx) - dir);
             inp[7] = rel.cos();
             inp[8] = rel.sin();
+            (gx / gmag, gy / gmag)
+        } else {
+            (0.0, 0.0)
         }
     }
 
@@ -827,9 +1320,34 @@ impl Simulation {
         if !self.protected.contains(&self.organisms[i].lineage) {
             drain += self.hazard_pressure(ox, oy);
         }
+        // queen metabolism multiplier (documented: drain scales by the
+        // config; 1.5 = she loses 1.5x what an identical body would)
+        let is_queen = self.queen.alive && self.organisms[i].id == self.queen.org_id as u64;
+        let qcfg = self.queen_config;
+        if is_queen {
+            drain *= qcfg.metabolism_mult.max(0.0);
+        }
+        // QUEEN SURVIVAL FLOOR: below `survival_floor` of her max energy she
+        // enters the crisis state — drain is scaled by `crisis_drain_scale`
+        // (metabolic saving) and a slow recovery trickle adds
+        // `survival_regen_per_sec` of her maximum energy back each second, so
+        // she always survives and can re-feed. Not a god shield: she still
+        // experiences the low-energy state her brain senses.
+        let crisis = is_queen
+            && self.organisms[i].energy
+                < self.organisms[i].max_energy.max(1.0) * qcfg.survival_floor.max(0.0);
+        if crisis {
+            drain *= qcfg.crisis_drain_scale.max(0.0).min(1.0);
+        }
         drain = drain.max(0.0);
         let o = &mut self.organisms[i];
         o.energy -= drain * dt;
+        if crisis {
+            let max_e = o.max_energy.max(1.0);
+            let regen = max_e * qcfg.survival_regen_per_sec.max(0.0) * dt;
+            o.energy = (o.energy + regen).min(o.max_energy.max(1.0));
+            self.step_gain += regen as f64;
+        }
         if !o.energy.is_finite() || o.energy <= 0.0 {
             o.energy = 0.0;
         }
@@ -855,9 +1373,16 @@ impl Simulation {
     }
 
     fn try_reproduce(&mut self, i: usize, events: &mut StepEvents) {
+        // the queen with a plugged brain never breeds through the evolved
+        // gate (her slot 2 records feed_seek; deliberate steering authority
+        // replaces the evolved repro decision)
+        let queen_brainrepro = self.queen.alive
+            && self.queen.brain.is_some()
+            && self.organisms[i].id == self.queen.org_id as u64;
         let gate_ok = {
             let o = &self.organisms[i];
             o.alive
+                && !queen_brainrepro
                 && o.repr_cooldown == 0
                 && o.age >= self.params.min_repro_age_steps
                 && o.energy >= o.genotype.traits.repr_threshold * o.max_energy
@@ -1248,6 +1773,11 @@ impl Simulation {
             total_age: self.total_age,
             total_hazard: self.total_hazard,
             starve_ring: self.starve_ring.clone(),
+            queen: self.queen_snapshot(),
+            ecology: ecology::EcologySave {
+                state: self.ecology.clone(),
+                rng: self.ecology_rng,
+            },
             age_ring: self.age_ring.clone(),
             hazard_ring: self.hazard_ring.clone(),
             starve_window: self.starve_window,
@@ -1320,8 +1850,62 @@ impl Simulation {
         sim.age_window = save.age_window;
         sim.hazard_window = save.hazard_window;
         set_rng_state(&mut sim.rng, save.rng_state, params.seed);
+        // v2 ecology layer (additive; pre-ecology saves load the serde
+        // default `EcologySave` and keep the freshly initialized state)
+        sim.ecology = save.ecology.state.clone();
+        sim.ecology_rng = save.ecology.rng;
+        // v2 queen layer (additive; pre-queen saves keep the null default
+        // slot). A brain is rebuilt ONLY through the registered factory —
+        // honest `brain_restore_failed` telemetry otherwise (with the bytes
+        // stashed for a later `set_queen_brain_factory` reclaim).
+        sim.restore_queen_snapshot(save.queen.as_ref());
         sim.refresh_stats();
         sim
+    }
+
+    /// Applies `SaveCore.queen` (see [`Simulation::queen_snapshot`]). Dead
+    /// queens restore dead (brain dropped, no respawn); an alive queen whose
+    /// organism is missing from the restored population is demoted honestly
+    /// (alive=false, `Other` cause). The brain is rebuilt only via the
+    /// registered factory.
+    fn restore_queen_snapshot(&mut self, qs: Option<&queen::QueenSnapshot>) {
+        let Some(qs) = qs else {
+            return; // never-crowned default slot is already exact
+        };
+        if !qs.alive && qs.org_id == 0 {
+            return;
+        }
+        self.queen.org_id = qs.org_id;
+        self.queen.crowned_tick = qs.crowned_tick;
+        self.queen.death_cause = qs.death_cause;
+        self.queen.energy_history.clone_from(&qs.energy_history);
+        self.queen.cap_energy_history();
+        self.queen.brain_ticks = qs.brain_ticks;
+        self.queen_config = qs.config;
+        self.queen_events.clone_from(&qs.events);
+        queen::trim_events(&mut self.queen_events);
+        self.queen.alive = qs.alive;
+        if self.queen.alive {
+            let org_ok = self
+                .organisms
+                .iter()
+                .any(|o| o.alive && o.id == self.queen.org_id as u64);
+            if !org_ok {
+                self.queen.alive = false;
+                self.queen.death_cause = Some(QueenDeath::Other);
+            }
+        }
+        if self.queen.alive {
+            if let Some(bs) = &qs.brain {
+                if let Some(b) = self.build_brain_from(bs) {
+                    self.queen.brain = Some(b);
+                } else {
+                    // honest telemetry: alive queen, unusable/missing brain
+                    self.queen.brain_restore_failed = true;
+                    self.queen.reclaim_brain = Some(bs.clone());
+                }
+            }
+        }
     }
 
     /// Contracted individual-accessor restore path (v1 saves). Fields not
@@ -1874,10 +2458,15 @@ impl Simulation {
                 if !exists {
                     return Err(format!("unknown species id {species_id}"));
                 }
+                // queen lifecycle rule: she is never removed by the purge
+                let qid = self.queen_id().map(|q| q as u64);
                 let (keep, purged): (Vec<Organism>, Vec<Organism>) =
                     std::mem::take(&mut self.organisms)
                         .into_iter()
-                        .partition(|o| o.lineage != species_id);
+                        .partition(|o| {
+                            o.lineage != species_id
+                                || qid == Some(o.id)
+                        });
                 self.organisms = keep;
                 let n = purged.len();
                 for o in purged {
@@ -1950,10 +2539,16 @@ impl Simulation {
             (self.world.width * 0.5, self.world.height * 0.5)
         };
         let r2 = METEOR_RADIUS * METEOR_RADIUS;
-        // organisms: burned (energy gone, Hazard death event next step)
+        // organisms: burned (energy gone, Hazard death event next step).
+        // queen lifecycle rule: she survives even a direct hit (she drains
+        // through the same hazard fire afterwards and must recover)
+        let qid = self.queen_id().map(|q| q as u64);
         let (remaining, burnt): (Vec<Organism>, Vec<Organism>) = std::mem::take(&mut self.organisms)
             .into_iter()
             .partition(|o| {
+                if qid == Some(o.id) {
+                    return true;
+                }
                 let dx = o.x - cx;
                 let dy = o.y - cy;
                 dx * dx + dy * dy > r2

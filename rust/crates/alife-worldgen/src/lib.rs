@@ -8,6 +8,9 @@ use noise::{NoiseFn, SuperSimplex};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+pub mod virtual_world;
+pub use virtual_world::{VirtualWorld, WorldSampling};
+
 pub use alife_common::WorldGenConfig;
 
 pub const BIOME_COUNT: usize = 6;
@@ -392,6 +395,9 @@ mod tests {
     #[test]
     fn perf_target_2400x1600_cell8() {
         let cfg = canonical();
+        // warm the rayon pool first: measure the real generation cost, not
+        // pool cold-start plus loader contention from sibling tests
+        let _warm = generate(&cfg);
         let t = std::time::Instant::now();
         let w = generate(&cfg);
         let dt = t.elapsed();

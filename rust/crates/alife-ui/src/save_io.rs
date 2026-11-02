@@ -4,7 +4,8 @@
 
 use alife_common::persist::{HistoryBuffer, WorldSave, FORMAT_ID, FORMAT_VERSION};
 use alife_common::{presets::Preset, LineageRecord, SimParams, WorldGenConfig};
-use alife_core::{SimApi, Simulation};
+use alife_core::queen::QueenSnapshot;
+use alife_core::{SaveCore, SimApi, Simulation};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -163,8 +164,30 @@ pub fn assemble_save(
     ws
 }
 
-/// Rebuild a Simulation from a loaded WorldSave via the engine contract.
-pub fn restore_from_save(ws: &WorldSave) -> Result<Simulation, String> {
+/// What a successful load hands back to the app shell: the restored
+/// simulation plus the queen-reign payload (v2 `SaveCore.queen`) so the
+/// crown-once flags and (where possible) the reign itself can be restored.
+pub struct RestoredSave {
+    pub sim: Simulation,
+    /// parse of `SaveCore.queen` (None = no reign in the save / v1 file).
+    pub queen_saved: Option<QueenSnapshot>,
+}
+
+impl RestoredSave {
+    /// The saved world already had a reign — alive queen (with a restorable
+    /// brain) or a dead one. Both block any future auto-crown/respawn.
+    pub fn queen_was_crowned(&self) -> bool {
+        self.queen_saved
+            .as_ref()
+            .is_some_and(|q| q.alive || q.death_cause.is_some())
+    }
+}
+
+/// Rebuild a Simulation from a loaded WorldSave. Prefers the v2 core blob
+/// (`SaveCore`, exact engine restore via `Simulation::from_save_core`); v1
+/// files (and a corrupt blob) fall back to the contracted individual-field
+/// restore path (`Simulation::from_save`) — unchanged behavior.
+pub fn restore_from_save(ws: &WorldSave) -> Result<RestoredSave, String> {
     if ws.format_id != FORMAT_ID {
         return Err(format!("not a save file (format \"{}\")", ws.format_id));
     }
@@ -175,16 +198,30 @@ pub fn restore_from_save(ws: &WorldSave) -> Result<Simulation, String> {
         ));
     }
     let world = alife_worldgen::generate(&ws.world_config);
-    Ok(Simulation::from_save(
-        &ws.params,
-        world,
-        ws.step_count,
-        ws.organisms.clone(),
-        ws.foods.clone(),
-        ws.edits.clone(),
-        ws.rng_state,
-        ws.records.clone(),
-    ))
+    if let Some(core_blob) = alife_data::core_blob(ws) {
+        if !core_blob.is_null() {
+            if let Ok(core) = serde_json::from_value::<SaveCore>(core_blob.clone()) {
+                return Ok(RestoredSave {
+                    sim: Simulation::from_save_core(&ws.params, world, &core),
+                    queen_saved: core.queen,
+                });
+            }
+            // corrupt blob: v1 best-effort restore below (honest fallback)
+        }
+    }
+    Ok(RestoredSave {
+        sim: Simulation::from_save(
+            &ws.params,
+            world,
+            ws.step_count,
+            ws.organisms.clone(),
+            ws.foods.clone(),
+            ws.edits.clone(),
+            ws.rng_state,
+            ws.records.clone(),
+        ),
+        queen_saved: None,
+    })
 }
 
 /// Export experiment config JSON into `<root>/experiments/<name>.json`.

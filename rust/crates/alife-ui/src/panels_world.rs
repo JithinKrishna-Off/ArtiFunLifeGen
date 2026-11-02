@@ -78,6 +78,7 @@ pub fn canvas(app: &mut AlifeApp, ui: &mut Ui, rect: Rect) -> CanvasResponse {
         hover_id,
         frame_seed: app.frame_no,
         weather,
+        queen_id: app.sim.queen_id().map(|q| q as u64),
         ..Default::default()
     };
 

@@ -7,6 +7,8 @@ edition.workspace = true
 alife-view3d = { workspace = true }
 alife-common.workspace = true
 alife-core.workspace = true
+alife-neural.workspace = true
+alife-governor.workspace = true
 alife-worldgen.workspace = true
 alife-render.workspace = true
 alife-data.workspace = true

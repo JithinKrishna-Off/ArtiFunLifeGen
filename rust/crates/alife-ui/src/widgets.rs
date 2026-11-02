@@ -113,12 +113,12 @@ pub fn weak_label(ui: &mut Ui, s: impl Into<String>) {
 
 /// Horizontal bar with label, proportional fill and a mono value on the right.
 #[allow(clippy::too_many_arguments)]
-pub fn bar_row(ui: &mut Ui, label: &str, value: f32, max: f32, color: Color32, value_text: &str) {
-    ui.horizontal(|ui| {
+pub fn bar_row(ui: &mut Ui, label: &str, value: f32, max: f32, color: Color32, value_text: &str) -> Response {
+    let row = ui.horizontal(|ui| {
         ui.add_sized(Vec2::new(104.0, 12.0), Label::new(RichText::new(label).weak().small()));
         let bar_w = (ui.available_width() - 64.0).max(40.0);
         let h = 10.0;
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(bar_w, h), Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(bar_w, h), Sense::hover());
         ui.painter().rect_filled(rect, 3.0, Color32::from_rgb(12, 16, 21));
         let f = if max > 0.0 { (value / max).clamp(0.0, 1.0) } else { 0.0 };
         if f > 0.004 {
@@ -132,7 +132,9 @@ pub fn bar_row(ui: &mut Ui, label: &str, value: f32, max: f32, color: Color32, v
             );
         }
         ui.add_sized(Vec2::new(60.0, 12.0), Label::new(mono(value_text.to_string(), theme::TEXT)));
+        resp
     });
+    row.inner
 }
 
 /// Icon/compact button with tooltip. Returns true when clicked.

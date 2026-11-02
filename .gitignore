@@ -3,3 +3,5 @@ rust/target/
 install-out.log
 install-err.log
 *.log
+appdata/
+rust/appdata/

@@ -27,6 +27,8 @@ pub struct DrawConfig {
     /// when Some, a weather pass (rain/clouds/effects/bolts/flash) draws
     /// between terrain and organisms. None = weather idle: zero cost.
     pub weather: Option<WeatherLayer>,
+    /// the crowned queen's organism id: gold spotlight halo + name label
+    pub queen_id: Option<u64>,
 }
 
 impl Default for DrawConfig {
@@ -42,6 +44,7 @@ impl Default for DrawConfig {
             hover_id: None,
             frame_seed: 0,
             weather: None,
+            queen_id: None,
         }
     }
 }
@@ -195,27 +198,46 @@ pub fn draw_world(
     let dot_only = pop > 2000 || view.scale() < 0.22;
     let mut drawn = 0u32;
     let hover_picker = if out.hovering { Some(hover) } else { None };
+    let mut out_queen_pos: Option<Pos2> = None;
     for o in organisms {
-        let is_sel = selected == Some(o.id);
+        let is_queen = cfg.queen_id == Some(o.id) && o.alive;
+        let is_sel = selected == Some(o.id) || is_queen;
+        if is_queen {
+            draw_queen_halo(&painter, view, o, cfg.frame_seed);
+        }
         let geometric_hover = o.alive && hover_picker.map(|(hx, hy)| {
             let r = organism_radius(&o.genotype.traits);
             (o.x - hx).powi(2) + (o.y - hy).powi(2) < r * r + 40.0
         }) == Some(true);
         // white hover ring also honors the throttled pick id from the UI
         let is_hover = geometric_hover || (o.alive && cfg.hover_id == Some(o.id));
-        if dot_only && !is_sel {
+        // the queen is never a fog dot: she keeps her full silhouette at any zoom
+        if (dot_only && !is_sel && !is_queen) {
             draw_dot_org(&painter, view, o);
         } else {
             draw_org(&painter, view, o, is_hover);
         }
         if is_sel {
-            draw_selection(&painter, view, o, cfg.show_sensor, cfg.frame_seed);
+            draw_selection(&painter, view, o, cfg.show_sensor && !is_queen, cfg.frame_seed);
         } else if is_hover {
             let c = view.world_to_screen(o.x, o.y);
             let r = organism_radius(&o.genotype.traits) * view.scale();
             painter.circle_stroke(c, r + 4.0, Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(238, 243, 248, 190)));
         }
         drawn += 1;
+        if is_queen {
+            out_queen_pos = Some(view.world_to_screen(o.x, o.y));
+        }
+    }
+    // the royal name plate: always above the queen, any zoom
+    if let Some(c) = out_queen_pos {
+        painter.text(
+            c + egui::vec2(0.0, -18.0),
+            Align2::CENTER_CENTER,
+            "QUEEN",
+            FontId::proportional(12.5),
+            Color32::from_rgba_unmultiplied(255, 208, 70, 235),
+        );
     }
     out.organisms_drawn = drawn;
 
@@ -415,6 +437,27 @@ fn draw_selection(p: &Painter, view: &WorldView, o: &Organism, sensor: bool, fra
     }
     p.circle_stroke(c, r + 5.0, Stroke::new(2.0_f32, accent));
     p.circle_stroke(c, outer, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(45, 212, 191, 90)));
+}
+
+/// Royal spotlight under the queen's body: soft gold radial glow + breathing
+/// double ring, visible from any zoom (min screen radius 6 px).
+fn draw_queen_halo(p: &Painter, view: &WorldView, o: &Organism, frame_seed: u64) {
+    let c = view.world_to_screen(o.x, o.y);
+    let r = (organism_radius(&o.genotype.traits) * view.scale()).max(6.0);
+    let pulse = (frame_seed as f32 * 0.06).sin().abs();
+    // soft gold bloom under the silhouette
+    p.circle_filled(c, r * 2.4 + 10.0 + 4.0 * pulse, Color32::from_rgba_unmultiplied(255, 204, 60, 30));
+    p.circle_stroke(c, r + 6.0, Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(255, 208, 70, 240)));
+    p.circle_stroke(c, r + 11.0 + 3.0 * pulse, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 208, 70, 120)));
+    // four small crown ticks around the halo crest
+    let k = frame_seed as f32 * 0.02;
+    for q in 0..4 {
+        let a = q as f32 * std::f32::consts::FRAC_PI_2 + k;
+        let (s, co) = a.sin_cos();
+        let p0 = c + egui::vec2(s, -co) * (r + 14.0 + 2.0 * pulse);
+        let p1 = c + egui::vec2(s, -co) * (r + 19.0 + 2.0 * pulse);
+        p.line_segment([p0, p1], Stroke::new(1.6_f32, Color32::from_rgba_unmultiplied(255, 214, 96, 200)));
+    }
 }
 
 fn draw_trail_points(p: &Painter, view: &WorldView, trails: &Trails, o: &Organism) {

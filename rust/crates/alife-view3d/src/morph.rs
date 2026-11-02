@@ -12,8 +12,7 @@
 //!   `update_gpu(&device, &queue, &frame)` each frame (queue is not
 //!   reachable from `draw_with`). Until `ensure_pipeline`, `draw_with`
 //!   draws nothing.
-//! - Depth is reverse-Z (`GreaterEqual`) to match terrain/grass; the blend
-//!   is plain alpha (translucent membranes); no SSAO / read-depth tricks.
+//! - Depth is standard forward-Z (`LessEqual`) to match terrain/grass; the blend is plain alpha (translucent membranes); no SSAO / read-depth tricks.
 //! - Group 0 binds a morph-owned copy of the same `CamUniform` block used
 //!   by terrain/grass; animation time rides in `.world_wh_time_flash.z` and
 //!   lightning flash in `.w`, so there is no extra uniform.
@@ -22,6 +21,8 @@
 pub mod templates;
 #[path = "morph_decomp.rs"]
 pub mod decomp;
+#[path = "morph_queen.rs"]
+pub mod queen;
 #[path = "morph_tests.rs"]
 #[cfg(test)]
 mod tests;
@@ -38,13 +39,15 @@ pub const BRAND_CELL: u32 = 0;
 pub const BRAND_FLAGELLATE: u32 = 1;
 pub const BRAND_COLONY: u32 = 2;
 pub const BRAND_FILAMENT: u32 = 3;
+/// Queen brand (morphological emphasis; is_queen selector).
+pub const BRAND_QUEEN: u32 = 4;
 
 /// Deterministic expressed-trait plumbing -> morphology brand. Pure function
 /// of the organism's contemporary traits (no hashing, no randomness; the
 /// renderer must never invent anatomy a trait table cannot support).
 /// Fallback: filaments/colonies when lineages grow large/life stages long.
 /// Colony rule: slow, cheap-moving, long-range-sensing bodies express a
-/// sessile multi-cell cluster life form (2-3 fused cells, decomp colony).
+/// sessile 3-lobed multi-cell cluster life form (decomp colony).
 pub fn brand_of(o: &Organism) -> u32 {
     let t = &o.genotype.traits;
     if t.size < 0.85 {
@@ -86,9 +89,14 @@ pub struct MorphStyle {
 
 /// Returns the style for an organism; queens get the distinctive boost, all
 /// others neutral (no visual data path changes for the rest of the field).
+/// `size_scale` = 2.0: with the giant rebalance (`decomp::QUEEN_SCALE`) the
+/// queen clamp target is trait size >= 1.0 -> visual size 2.0, which yields
+/// her ~16-unit crown-to-tail body length (giant vs the tiny ordinary
+/// re-scale via `decomp::ORGANISM_UNIT_RADIUS` = 0.75, ~1.2-1.5-unit bodies;
+/// 10-20x apparent ratio).
 pub fn style_for(org_is_queen: bool) -> MorphStyle {
     if org_is_queen {
-        MorphStyle { hue_shift: 0.12, size_scale: 1.5, breathe_scale: 1.8 }
+        MorphStyle { hue_shift: 0.12, size_scale: 2.0, breathe_scale: 1.8 }
     } else {
         MorphStyle { hue_shift: 0.0, size_scale: 1.0, breathe_scale: 1.0 }
     }
@@ -140,6 +148,9 @@ pub struct Morph {
     cam_bg: wgpu::BindGroup,
     /// per-frame planner; on the happy path this never touches the heap
     planner: Option<Mutex<decomp::Planner>>,
+    /// selection/hover marker overlay (one extra instanced draw, <= 3
+    /// instances); lazily pipelined with `ensure_pipeline`
+    pub markers: crate::scene::markers::MarkerRig,
 }
 
 impl Morph {
@@ -161,12 +172,13 @@ impl Morph {
                 count: None,
             }],
         });
-        // template soup: [shell 1440][tail 1152][billboard 6] verts
+        // template soup: [shell 1440][tail 1152][billboard 6][queen ~3930] verts
         let t = templates::build();
-        let mut verts: Vec<TVert> = Vec::with_capacity(t.vcount() as usize);
+        let mut verts: Vec<TVert> = Vec::with_capacity((t.vcount() + templates::QUEEN_VCOUNT) as usize);
         verts.extend_from_slice(&t.shell);
         verts.extend_from_slice(&t.tail);
         verts.extend_from_slice(&t.quad);
+        verts.extend_from_slice(&queen::build());
         let verts_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("view3d.morph.verts"),
             contents: bytemuck::cast_slice(&verts),
@@ -199,6 +211,7 @@ impl Morph {
             cam_buf,
             cam_bg,
             planner: Some(Mutex::new(decomp::Planner::new())),
+            markers: crate::scene::markers::MarkerRig::new(),
         })
     }
 
@@ -310,10 +323,10 @@ impl Morph {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: depth_format,
-                    // reverse-Z to match terrain/grass; translucent pass
-                    // must not write depth so membranes layer by draw order
+                    // standard forward-Z (matches terrain/grass): translucent
+                    // pass must not write depth so membranes layer by draw order
                     depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::GreaterEqual,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
@@ -322,18 +335,45 @@ impl Morph {
                 cache: None,
             });
         self.gpu = Some(Gpu { pipeline });
+        self.markers.ensure(device, color_format, depth_format);
+    }
+
+    /// TEMP diag: current plan bucket counts.
+    pub fn diag_plan(&self) -> (u32, u32, u32, u32) {
+        match self.planner.as_ref() {
+            Some(p) => {
+                let g = p.lock().unwrap_or_else(|err| err.into_inner());
+                let c = g.current();
+                (c.tail_n, c.shell_n, c.queen_n, c.quad_n)
+            }
+            None => (0, 0, 0, 0),
+        }
+    }
+
+    /// QUEEN-only: this frame's queen trample footprint from the planner as
+    /// `(queen_x, queen_z, radius, strength)`; `None` when no queen was
+    /// planned (or before the first `update_gpu`). The lead feeds this into
+    /// the grass `GrassUniform.trample` build site (grass.rs:401).
+    pub fn queen_footprint(&self) -> Option<(f32, f32, f32, f32)> {
+        match self.planner.as_ref() {
+            Some(p) => p.lock().unwrap_or_else(|err| err.into_inner()).queen_footprint(),
+            None => None,
+        }
     }
 
     /// Per-frame planning + uploads; the coordinator calls this in
     /// `View3D::update` right before/after grass's `update_gpu`.
     pub fn update_gpu(&mut self, _device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame3D) {
         queue.write_buffer(&self.cam_buf, 0, bytemuck::bytes_of(&frame.cam));
+        self.markers.update(queue, frame);
         let Some(planner) = self.planner.as_ref() else { return };
         let mode = mode_of(&frame.cam_mode);
         let view = [frame.cam.view_pos[0], frame.cam.view_pos[1], frame.cam.view_pos[2]];
         // height + frustum live with terrain/grass-owned modules (read-only)
         let frustum = crate::grass::frustum::Frustum::from_cam(&frame.cam.view, &frame.cam.proj);
         let mut guard = planner.lock().unwrap_or_else(|p| p.into_inner());
+        // QUEEN-only: engine dt for gait-speed estimation from position delta
+        guard.set_frame_dt(frame.dt);
         let okay = guard.plan(
             &frame.orgs,
             view,
@@ -358,10 +398,15 @@ impl Morph {
         // planner mutex hands the current plan to the paint path.
         let plan_guard = planner.lock().unwrap_or_else(|p| p.into_inner());
         let plan = plan_guard.current();
-        if (plan.tail_n + plan.shell_n + plan.quad_n) == 0 || plan.insts.is_empty() {
+        if (plan.tail_n + plan.shell_n + plan.queen_n + plan.quad_n) == 0 || plan.insts.is_empty() {
             return;
         }
-        let (tn, sn, qn) = (plan.tail_n as u64, plan.shell_n as u64, plan.quad_n as u64);
+        let (tn, sn, qun, qn) = (
+            plan.tail_n as u64,
+            plan.shell_n as u64,
+            plan.queen_n as u64,
+            plan.quad_n as u64,
+        );
         let stride = INST_STRIDE as u64;
         pass.set_pipeline(&gpu.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
@@ -377,13 +422,31 @@ impl Morph {
                 0..sn as u32,
             );
         }
+        if qun > 0 {
+            pass.set_vertex_buffer(
+                1,
+                self.inst_buf
+                    .slice((tn + sn) * stride..(tn + sn + qun) * stride),
+            );
+            pass.draw(
+                templates::QUEEN_VBASE..templates::QUEEN_VBASE + templates::QUEEN_VCOUNT,
+                0..qun as u32,
+            );
+        }
         if qn > 0 {
-            pass.set_vertex_buffer(1, self.inst_buf.slice((tn + sn) * stride..(tn + sn + qn) * stride));
+            pass.set_vertex_buffer(1, self.inst_buf.slice((tn + sn + qun) * stride..(tn + sn + qun + qn) * stride));
             pass.draw(
                 templates::QUAD_VBASE..templates::QUAD_VBASE + templates::QUAD_VCOUNT,
                 0..qn as u32,
             );
         }
+    }
+
+    /// Selection/hover marker overlay: ONE instanced draw call (<= 3
+    /// camera-facing ring quads), drawn right after the organism body pass.
+    /// No-op until `ensure_pipeline` armed it and no marker is set.
+    pub fn draw_markers(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.markers.draw(pass);
     }
 }
 
@@ -426,6 +489,14 @@ fn vs(i: VIn) -> VOut {
     let t = cam.world_wh_time_flash.z;
     let r = max(i.iradius, 0.02);
     var local = i.tpos.xyz;
+    // ORDINARY body silhouettes (ids 0..2.5 - queen ids start at 6.0) from
+    // the unscaled template position:
+    // - gentle prolate ellipsoid squash along heading (+X);
+    // - teardrop taper when the flagellate shell carries the silhouette code
+    //   floor(flags / 10) == 1 (frac(flags) keeps the nucleus gate).
+    let ell = vec3<f32>(1.14, 0.86, 0.94);
+    let body_s = clamp(0.5 + 0.5 * local.x, 0.0, 1.0);
+    let taper = mix(1.0, 0.5 + 0.55 * body_s * body_s, floor(i.iflags / 10.0));
     var a_out = i.ialpha;
     var nuv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if (id < 0.5) {
@@ -433,17 +504,17 @@ fn vs(i: VIn) -> VOut {
         let delay = (i.ipos.x + i.ipos.z) * 0.13;
         let breath = 0.55 * sin(t * i.iwave + i.iphase + delay)
                    + 0.30 * sin(t * i.iwave * 1.7 + i.iphase * 2.1 + delay * 1.3);
-        local = local * (1.0 + i.ibreathe * breath) * r;
+        local = local * taper * ell * (1.0 + i.ibreathe * breath) * r;
         nuv = vec4<f32>(normalize(i.tpos.xyz), nuv.w);
     } else if (id < 1.5) {
         // cytoplasm core: soft inner counter-pulse
-        local = local * (1.0 + i.ibreathe * 0.35 * sin(t * i.iwave + i.iphase + 0.7)) * r;
+        local = local * taper * ell * (1.0 + i.ibreathe * 0.35 * sin(t * i.iwave + i.iphase + 0.7)) * r;
         nuv = vec4<f32>(normalize(i.tpos.xyz), nuv.w);
     } else if (id < 2.5) {
         // nucleus-like organelle: alpha-gated by the trait table
         let gate = step(0.5, fract(i.iflags));
         a_out = a_out * gate;
-        local = local * (1.0 + i.ibreathe * 0.2 * sin(t * i.iwave * 0.8 + i.iphase)) * r;
+        local = local * taper * ell * (1.0 + i.ibreathe * 0.2 * sin(t * i.iwave * 0.8 + i.iphase)) * r;
         nuv = vec4<f32>(normalize(i.tpos.xyz), nuv.w);
     } else if (id < 4.5) {
         // flagella: vertex-shader wave along the bezier chord (param in x)
@@ -458,15 +529,34 @@ fn vs(i: VIn) -> VOut {
             a_out = 0.0;
         }
         nuv = vec4<f32>(0.0, 0.0, 0.0, tt);
-    } else {
+    } else if (id < 5.5) {
         // billboard disc: camera-facing expansion around the world center
         let va = vec3<f32>(cam.view[0][0], cam.view[1][0], cam.view[2][0]);
         let vu = vec3<f32>(cam.view[0][1], cam.view[1][1], cam.view[2][1]);
         local = va * (i.tpos.x * r) + vu * (i.tpos.y * r);
         nuv = vec4<f32>(i.tpos.x, i.tpos.y, 0.0, 0.0);
+    } else if (id < 7.0) {
+        // queen sphere lobes (head 6.0 / thorax 6.25 / abdomen 6.5):
+        // regular breathing + pulse; abdomen carries ridge bands along +X
+        var breathe = 1.0 + i.ibreathe * 0.14 * sin(t * i.iwave * 0.8 + i.iphase);
+        if (id > 6.6) {
+            breathe = breathe * (1.0 + 0.045 * sin(local.x * 7.0));
+        }
+        local = local * breathe * r;
+        nuv = vec4<f32>(normalize(i.tpos.xyz), 0.0);
+    } else if (id < 7.5) {
+        // antennae + limb stubs: gentle enzymless wave (amp tapers to tip)
+        let tt = i.taux.x;
+        let amp = 0.05 * (0.3 + 0.7 * (1.0 - tt));
+        local.y = local.y + amp * sin(tt * 7.0 - t * i.iwave * 0.7 + i.iphase);
+        nuv = vec4<f32>(normalize(i.tpos.xyz), tt);
+    } else {
+        // crown spikes: dignified slow shimmer
+        local = local * (1.0 + 0.035 * sin(t * 1.7 + i.iphase * 0.5)) * r;
+        nuv = vec4<f32>(normalize(i.tpos.xyz), 0.0);
     }
     var world = vec3<f32>(0.0);
-    if (id < 4.5) {
+    if (id != 5.0) {
         // heading rotation: template +X -> world (cos h, 0, sin h)
         let c = cos(i.iheading);
         let s = sin(i.iheading);
@@ -559,15 +649,35 @@ fn fs(fi: FsIn) -> @location(0) vec4<f32> {
         let shimmer = 0.5 + 0.5 * sin(tt * 6.0 - t * fi.misc.z * 2.0);
         col = hsv(hue, sat * 0.85, mix(0.42, 0.60, tt)) * mix(0.85, 1.0, shimmer);
         a_mat = 0.72;
-    } else {
+    } else if (id < 5.5) {
         // billboard: soft radial edge
         let rr = clamp(length(fi.nuv.xy), 0.0, 1.0);
         let edge = 1.0 - smoothstep(0.55, 1.0, rr);
         col = hsv(hue, sat * 0.9, 0.55);
         a_mat = edge * 0.85;
+    } else if (id < 7.0) {
+        // queen body lobes: gum-like body color, rim-lit like the membrane
+        // but more opaque; brighter with turgor + a subtle energy pulse
+        let n = normalize(fi.nuv.xyz);
+        let lam = clamp(abs(dot(n, sun)), 0.0, 1.0);
+        let rim = clamp(1.0 - lam, 0.0, 1.0);
+        let pulse = 0.03 * sin(t * 1.4);
+        col = hsv(hue, sat * 0.88, mix(0.34, 0.56, lam) + pulse) + rim * 0.14;
+        a_mat = 0.78;
+    } else if (id < 7.5) {
+        // antennae + limbs: darker chitin
+        let tt = fi.info.y;
+        col = hsv(hue, sat * 0.7, mix(0.32, 0.40, tt));
+        a_mat = 0.82;
+    } else {
+        // crown: gold spikes with a slow dignity shimmer
+        let shimmer = 0.5 + 0.5 * sin(t * 1.7);
+        col = hsv(0.13, 0.55, 0.78 + 0.07 * shimmer);
+        a_mat = 0.95;
     }
     var c = col;
     c += flash * 0.25;
     return vec4(c, a_in * a_mat);
 }
 "#;
+

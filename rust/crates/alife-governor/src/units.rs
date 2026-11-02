@@ -8,7 +8,7 @@
 //!
 //! | Space | Newtype | Unit | Source |
 //! |---|---|---|---|
-//! | (a) Real hardware | [`HardwareMemory`] | bytes (process working set) | measured (sysinfo / mock) |
+//! | (a) Real hardware | [`HardwareMemory`] | bytes (process working set) | measured (OS syscalls / mock) |
 //! | (a) Real hardware | `f32` CPU percent | % of one core, EMA-smoothed | measured |
 //! | (b) Abstract compute | [`ComputeUnits`] | CU (fictional, governor-defined) | scheduler accounting |
 //! | (c) Biology | [`BioEnergy`] | core's native `f32` energy | `Organism::energy` |

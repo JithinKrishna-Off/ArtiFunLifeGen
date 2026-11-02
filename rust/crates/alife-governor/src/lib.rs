@@ -3,9 +3,9 @@
 //! Two subsystems, one crate:
 //!
 //! 1. **Hardware guardian** ([`hardware`] + [`Governor::poll`]): real,
-//!    process-local measurements (sysinfo working-set memory, EMA-smoothed
-//!    process CPU), budget thresholds with hysteresis, diagnostics and an
-//!    *advisory* escalation ladder.
+//!    process-local measurements via raw `windows-sys` syscalls (working-set
+//!    memory, EMA-smoothed process CPU), budget thresholds with hysteresis,
+//!    diagnostics and an *advisory* escalation ladder.
 //! 2. **Simulation scheduler** ([`policy`] + [`Governor::plan`]):
 //!    deterministic per-tick allocation plans over three strictly separated
 //!    unit spaces, plus (opt-in) computational-selection CU starvation
@@ -37,7 +37,7 @@
 //!   to the budget, by design (app-only).
 //! * The first `poll` after startup reads CPU as ~0 (OS needs two refresh
 //!   samples); the EMA smooths this.
-//! * CPU percent is "percent of one core" as reported by sysinfo; on a
+//! * CPU percent is "percent of one core" from a `GetProcessTimes` delta; on
 //!   10-core machine 100.0 means "one core fully busy".
 
 pub mod events;
@@ -47,14 +47,17 @@ pub mod policy;
 pub mod units;
 
 pub use events::{EventKind, GovernorEvent, EVENT_RING_MAX};
-pub use governor::{Governor, GovernorConfig};
+pub use governor::{
+    Governor, GovernorApplyHint, GovernorConfig, STEP_CAP_CRITICAL, STEP_CAP_WARN,
+    VISUAL_DEGRADE_CRITICAL, VISUAL_DEGRADE_INTERMEDIATE, VISUAL_DEGRADE_WARN,
+};
 pub use hardware::{
     advisory_ladder, AdvisoryAction, Budget, GovernorDiagnostic, GovernorState, MeasureSource,
     SysMetrics,
 };
 pub use policy::{
-    compute_starvation_review, AllocationPlan, ComputeReview, ControllerCost, Policy, PolicyInput,
-    SubsystemShares, TickBudgets,
+    compute_starvation_review, AllocationPlan, ApplyHints, ComputeReview, ControllerCost, Policy,
+    PolicyInput, SubsystemShares, SubsystemTimings, TickBudgets,
 };
 pub use units::{BioEnergy, ComputeUnits, HardwareMemory};
 

@@ -23,9 +23,15 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::connectome::{Connectome, Polarity};
-use crate::motor::{decode as motor_decode, MotorConfig, MotorOutput, OUTPUT_CELL_COUNT};
+use crate::motor::{
+    decode_cells as motor_decode_cells, decode_pools as motor_decode_pools, MotorConfig,
+    MotorOutput, OUTPUT_CELL_COUNT,
+};
 use crate::provenance::{ProvenanceRecord, ProvenanceTag};
-use crate::sensory::{encode_into, inputs_needed, validate_mapping, Encoder, SensoryConfig, SensoryInput};
+use crate::sensory::{
+    channels as sensory_channels, encode_channels_explicit, inputs_needed, validate_mapping,
+    Encoder, SensoryConfig, SensoryInput, CHANNEL_COUNT,
+};
 use crate::state::{BrainState, LifParams, MAX_RING_DELAY};
 
 /// Policy for synapses/neurons whose polarity is Unknown (configurable and
@@ -60,9 +66,14 @@ pub struct TickBudget {
 
 impl Default for TickBudget {
     fn default() -> Self {
+        // Sized so one tick stays in the LOW-millisecond range even on the
+        // largest Queen subnetwork (40k neurons / ~6M synapses): ~65k
+        // scattered CSR relaxations cost a few ms on the reference machine.
+        // Work past the cap is RECORDED as dropped_synops (deterministic),
+        // never silently absorbed.
         Self {
             max_spikes: 4096,
-            max_synops: 262_144,
+            max_synops: 65_536,
         }
     }
 }
@@ -88,6 +99,69 @@ pub struct Stats {
     pub dropped_synops: u64,
     pub exec_ns: u64,
     pub mem_est: u64,
+}
+
+/// Observability: per-tick activity sample for the ring trace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ActivitySample {
+    pub tick: u64,
+    /// cells that were injected or refractory this tick.
+    pub active: u64,
+    pub spikes: u64,
+}
+
+/// Bounded activity ring (`<= MAX_TRACE` entries; the OLDEST sample is dropped
+/// once full). Observatory-replay bookkeeping only: excluded from snapshots
+/// and determinism.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ActivityTrace {
+    entries: Vec<ActivitySample>,
+}
+
+/// Ring capacity.
+pub const MAX_TRACE: usize = 4096;
+/// EMA factor for `ActivityStats.avg_rate_ema` (fixed, documented).
+pub const AVG_RATE_EMA_ALPHA: f32 = 0.1;
+
+impl ActivityTrace {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push one sample; drops the oldest when at capacity.
+    pub fn push(&mut self, sample: ActivitySample) {
+        if self.entries.len() >= MAX_TRACE {
+            self.entries.remove(0);
+        }
+        self.entries.push(sample);
+    }
+
+    pub fn as_slice(&self) -> &[ActivitySample] {
+        &self.entries
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Aggregate activity view for the observatory (measured, never deterministic
+/// state).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ActivityStats {
+    pub active_neurons: u64,
+    pub spikes_last: u64,
+    pub exec_ns: u64,
+    /// EMA of the mean per-neuron firing rate in Hz: `(spikes / n) / dt`.
+    pub avg_rate_ema: f32,
 }
 
 /// Snapshot of the mutable runtime state (Queen save/restore).
@@ -129,6 +203,34 @@ pub struct FlyBrainRuntime {
     last_stats: Stats,
     out_start: usize,
     mapping_ok: bool,
+    /// Optional region-based sensory binding: explicit absolute neuron index
+    /// per (channel, cell) slot, length `inputs_needed(sensory)`. `None` keeps
+    /// the default contiguous first-N layout. Configuration (persists across
+    /// `restore_snapshot`), never simulation state.
+    input_binding: Option<Vec<usize>>,
+    /// Optional explicit motor output binding (six real neuron ids, one per
+    /// [OutputCell] slot). `None` keeps the contiguous window starting at
+    /// `out_start`. Configuration (persists across `restore_snapshot`).
+    out_cells: Option<[usize; 6]>,
+    /// Optional POPULATION-level output binding: one pool of real neurons per
+    /// FUNCTIONAL channel (K = pools.len(), 1..=6, whatever the anatomy
+    /// justified); the channel decodes the POOL MEAN rate (see
+    /// `motor::decode_pools`). A pool averages away single-cell noise — the
+    /// measured scene responses of the descending/motor POPULATIONS are far
+    /// larger than those of individual cells. Anatomical populations and
+    /// functional motor channels are DISTINCT here: K channels map onto the
+    /// body DOFs in fixed order, and body DOFs beyond K decode neutral.
+    /// Takes precedence over `out_cells` when installed. Configuration
+    /// (persists across snapshots).
+    out_pools: Option<Vec<Vec<u32>>>,
+    /// Region selectivity gate (`Some` = only gated-in spiked neurons
+    /// propagate their CSR rows). Diagnostic/observatory configuration; NOT
+    /// part of snapshots (it persists across restore_snapshot by design).
+    region_gate: Option<Vec<bool>>,
+    /// Bounded activity ring for observatory replay.
+    activity: ActivityTrace,
+    /// EMA of mean per-neuron firing rate (Hz), observatory-only.
+    avg_rate_ema: f32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -167,7 +269,173 @@ impl FlyBrainRuntime {
             last_stats: Stats::default(),
             out_start: n - OUTPUT_CELL_COUNT,
             mapping_ok,
+            input_binding: None,
+            out_cells: None,
+            out_pools: None,
+            region_gate: None,
+            activity: ActivityTrace::new(),
+            avg_rate_ema: 0.0,
         })
+    }
+
+    /// Install an explicit absolute-neuron binding for every (channel, cell)
+    /// sensory slot (length must equal `inputs_needed(sensory)`; every index
+    /// must be in range). Returns false (no change) on any mismatch.
+    pub fn set_input_binding(&mut self, binding: &[usize]) -> bool {
+        let need = inputs_needed(&self.sensory);
+        if binding.len() != need || binding.iter().any(|&i| i >= self.connectome.n()) {
+            return false;
+        }
+        self.input_binding = Some(binding.to_vec());
+        true
+    }
+
+    /// Clear a previously installed sensory binding (back to contiguous).
+    pub fn clear_input_binding(&mut self) {
+        self.input_binding = None;
+    }
+
+    /// The installed binding, if any (`None` = contiguous default).
+    pub fn input_binding(&self) -> Option<&[usize]> {
+        self.input_binding.as_deref()
+    }
+
+    /// Move the motor output window: the six output DECISION cells become
+    /// neurons `[start, start + OUTPUT_CELL_COUNT)`. Bounded so the window
+    /// stays inside the connectome and clear of sensory inputs; returns false
+    /// (no change) otherwise. Used by region-based queen bindings.
+    pub fn set_output_start(&mut self, start: usize) -> bool {
+        let need = inputs_needed(&self.sensory);
+        if start < need || start + OUTPUT_CELL_COUNT > self.connectome.n() {
+            return false;
+        }
+        self.out_start = start;
+        true
+    }
+
+    /// The current output-cell window start (first cell of the default
+    /// contiguous window; telemetry only when an explicit binding is active).
+    pub fn output_start(&self) -> usize {
+        self.out_start
+    }
+
+    /// Explicit region-grounded output binding: replaces the contiguous
+    /// `[out_start, out_start + 6)` window with six arbitrary real neurons
+    /// (one per [OutputCell] slot, order fixed). All indices must be inside
+    /// the connectome, unique and clear of the sensory input cells; returns
+    /// false (no change) otherwise. Mirrors `set_input_binding`.
+    pub fn set_output_binding(&mut self, cells: &[usize; OUTPUT_CELL_COUNT]) -> bool {
+        let need = inputs_needed(&self.sensory);
+        let n = self.connectome.n();
+        for (k, &c) in cells.iter().enumerate() {
+            if c < need || c >= n {
+                return false;
+            }
+            if cells[..k].contains(&c) {
+                return false;
+            }
+        }
+        let mut owned = *cells;
+        owned.sort_unstable();
+        self.out_start = owned[0];
+        self.out_cells = Some(*cells);
+        true
+    }
+
+    /// Remove an explicit output binding (falls back to the contiguous
+    /// `[out_start, out_start + 6)` window; see [`FlyBrainRuntime::set_output_start`]).
+    pub fn clear_output_binding(&mut self) {
+        self.out_cells = None;
+        self.out_pools = None;
+    }
+
+    /// Install POPULATION-level output pools (one pool per FUNCTIONAL
+    /// channel; K = `pools.len()` in 1..=OUTPUT_CELL_COUNT — the pool count is
+    /// whatever the anatomical data justified, NOT forced to six). Every cell
+    /// must be a real neuron index (>= `inputs_needed`, < `n`) and no cell may
+    /// appear in two pools. Each pool must be non-empty. Returns false (no
+    /// change) otherwise. The channel decode then reads the POOL MEAN spike
+    /// rate (motor::decode_pools); body DOFs beyond K decode neutral.
+    pub fn set_output_pools(&mut self, pools: &[&[usize]]) -> bool {
+        let need = inputs_needed(&self.sensory);
+        let n = self.connectome.n();
+        if pools.is_empty() || pools.len() > OUTPUT_CELL_COUNT {
+            return false;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut owned: Vec<Vec<u32>> = Vec::with_capacity(pools.len());
+        for pool in pools {
+            if pool.is_empty() {
+                return false;
+            }
+            let mut p = Vec::with_capacity(pool.len());
+            for &c in pool.iter() {
+                if c < need || c >= n || !seen.insert(c) {
+                    return false;
+                }
+                p.push(c as u32);
+            }
+            p.sort_unstable();
+            owned.push(p);
+        }
+        self.out_start = owned.iter().map(|p| p[0] as usize).min().unwrap_or(n);
+        self.out_pools = Some(owned);
+        true
+    }
+
+    /// The installed population output pools, if any.
+    pub fn output_pools(&self) -> Option<&[Vec<u32>]> {
+        self.out_pools.as_deref()
+    }
+
+    /// Install the measured per-channel decode calibration (baseline + range
+    /// Hz, both length = channel count K). See `MotorConfig::calib_baseline`.
+    /// `None` args clear the calibration (back to the absolute-rate decode).
+    /// Returns false (no change) on length mismatch.
+    pub fn set_motor_calibration(
+        &mut self,
+        baseline: Option<&[f32]>,
+        range: Option<&[f32]>,
+    ) -> bool {
+        match (baseline, range) {
+            (Some(b), Some(r))
+                if b.len() == r.len()
+                    && (1..=OUTPUT_CELL_COUNT).contains(&b.len()) =>
+            {
+                self.motor.calib_baseline = Some(b.to_vec());
+                self.motor.calib_range = Some(r.to_vec());
+                true
+            }
+            _ => {
+                self.motor.calib_baseline = None;
+                self.motor.calib_range = None;
+                false
+            }
+        }
+    }
+
+    /// The installed decode calibration (Hz per output slot).
+    pub fn motor_calibration(&self) -> (Option<&[f32]>, Option<&[f32]>) {
+        (
+            self.motor.calib_baseline.as_deref(),
+            self.motor.calib_range.as_deref(),
+        )
+    }
+
+    /// The active output cell binding, if an explicit one is installed.
+    pub fn output_cells(&self) -> Option<&[usize; OUTPUT_CELL_COUNT]> {
+        self.out_cells.as_ref()
+    }
+
+    /// Per-neuron spike IDs of the last tick (ascending; observatory /
+    /// binding-diagnostic use).
+    pub fn spike_ids_last(&self) -> &[u32] {
+        &self.brain.spiked
+    }
+
+    /// The active motor decoder configuration (rates/EMA tempo).
+    pub fn motor_cfg(&self) -> &crate::motor::MotorConfig {
+        &self.motor
     }
 
     pub fn connectome(&self) -> &Arc<Connectome> {
@@ -193,20 +461,34 @@ impl FlyBrainRuntime {
         validate_mapping(&self.connectome, &cfg, OUTPUT_CELL_COUNT)
     }
 
-    /// Deterministic fixed-step tick.
-    #[allow(clippy::too_many_lines)]
+    /// Deterministic fixed-step tick (world-facing path: fills the 11 sensory
+    /// channels from a [`SensoryInput`] and steps).
     pub fn tick(&mut self, input: &SensoryInput, budget: &TickBudget) -> MotorOutput {
+        let chans = sensory_channels(input);
+        self.tick_channels(&chans, budget)
+    }
+
+    /// Deterministic fixed-step tick with an explicit channel vector
+    /// (`chans[c]` must hold each channel's RAW value in its documented
+    /// domain; defensive clamping/mapping applies afterwards, exactly as for
+    /// the `SensoryInput` path). Enables alternate sensory mappings (queen
+    /// adapter) without touching the world contract.
+    ///
+    /// Step order and determinism are identical to `tick`.
+    #[allow(clippy::too_many_lines)]
+    pub fn tick_channels(&mut self, chans: &[f32; CHANNEL_COUNT], budget: &TickBudget) -> MotorOutput {
         let t0 = std::time::Instant::now();
         self.brain.tick += 1;
         let tick = self.brain.tick;
 
         // (1) sensory injection into channel-bound input cells
-        encode_into(
+        encode_channels_explicit(
             &mut self.sensory,
-            input,
+            chans,
             self.lif.dt_ms,
             &mut self.brain.inj,
             &self.encoders,
+            self.input_binding.as_deref(),
         );
 
         // (2) drain delayed arrivals scheduled for this tick
@@ -227,12 +509,19 @@ impl FlyBrainRuntime {
         }
 
         // (4) event-driven propagation: touch only spiked rows, ascending.
+        // Region selectivity (when active) gates WHICH spiked rows propagate
+        // at all; neuron indices/body IDs are never re-mapped.
         let mut synops = 0usize;
         let processed = spiked.len().min(budget.max_spikes);
         let dropped_spikes = (spiked.len() - processed) as u64;
         let mut dropped_synops = 0u64;
         let mut slots: Vec<(usize, u32, f32)> = Vec::new();
         'rows: for &s in spiked.iter().take(processed) {
+            if let Some(gate) = self.region_gate.as_ref() {
+                if !gate[s as usize] {
+                    continue 'rows;
+                }
+            }
             let rs = self.connectome.row_offsets[s as usize] as usize;
             let re = self.connectome.row_offsets[s as usize + 1] as usize;
             for i in rs..re {
@@ -263,14 +552,30 @@ impl FlyBrainRuntime {
             *x = 0.0;
         }
 
-        // (6) motor decode from output cell spike counts
-        let motor = motor_decode(
-            &mut self.motor,
-            &self.brain.spiked,
-            self.lif.dt_ms,
-            self.out_start,
-        );
-
+        // (6) motor decode from output cell spike counts: contiguous window
+        // by default; explicit region-grounded binding when installed; a
+        // population-pool binding decodes the POOL MEAN rate per channel.
+        let s0 = self.out_start;
+        let default_cells = [
+            s0, s0 + 1, s0 + 2, s0 + 3, s0 + 4, s0 + 5,
+        ];
+        let motor = if let Some(pools) = self.out_pools.as_ref() {
+            let refs: Vec<&[u32]> = pools.iter().map(|p| p.as_slice()).collect();
+            motor_decode_pools(
+                &mut self.motor,
+                &self.brain.spiked,
+                self.lif.dt_ms,
+                &refs,
+            )
+        } else {
+            let cells_ref = self.out_cells.as_ref().unwrap_or(&default_cells);
+            motor_decode_cells(
+                &mut self.motor,
+                &self.brain.spiked,
+                self.lif.dt_ms,
+                cells_ref,
+            )
+        };
         self.last_stats = Stats {
             neuron_count: self.connectome.n() as u64,
             synapse_count: self.connectome.weights.len() as u64,
@@ -281,6 +586,22 @@ impl FlyBrainRuntime {
             exec_ns: t0.elapsed().as_nanos() as u64,
             mem_est: self.connectome.memory_bytes(),
         };
+
+        // Observatory bookkeeping (never deterministic state; excluded from
+        // snapshots). Mean per-neuron rate in Hz from this tick's spike count.
+        let dt_s = self.lif.dt_ms.max(0.001) / 1000.0;
+        let rate = if self.connectome.n() > 0 {
+            (self.brain.spiked.len() as f32) / (self.connectome.n() as f32) / dt_s
+        } else {
+            0.0
+        };
+        self.avg_rate_ema += AVG_RATE_EMA_ALPHA * (rate - self.avg_rate_ema);
+        self.activity.push(ActivitySample {
+            tick,
+            active: self.last_stats.active,
+            spikes: self.last_stats.spikes,
+        });
+
         motor
     }
 
@@ -298,6 +619,52 @@ impl FlyBrainRuntime {
                 UnknownPolarityPolicy::Scale(f) => w * f,
             },
         }
+    }
+
+    // ------------------------------------------------- observatory / activity
+    /// Aggregate activity view (last tick + EMA; measured only).
+    pub fn activity_stats(&self) -> ActivityStats {
+        let st = self.last_stats;
+        ActivityStats {
+            active_neurons: st.active,
+            spikes_last: st.spikes,
+            exec_ns: st.exec_ns,
+            avg_rate_ema: self.avg_rate_ema,
+        }
+    }
+
+    /// Bounded activity ring (newest-last, oldest dropped past 4096) for
+    /// observatory replay.
+    pub fn trace(&self) -> &[ActivitySample] {
+        self.activity.as_slice()
+    }
+
+    /// Observatory/diagnostic: restrict PROPAGATION (`tick_channels` step 4)
+    /// to spiked neurons whose region name satisfies `pred`. Neurons without
+    /// an assigned region never match. Source neuron indices and body IDs are
+    /// PRESERVED (this is a run-mode gate, not a re-index). Returns how many
+    /// neurons will propagate. A later call replaces the gate;
+    /// [`FlyBrainRuntime::clear_selectivity`] removes it. Not snapshot state.
+    pub fn select_region(&mut self, pred: impl Fn(&str) -> bool) -> usize {
+        let conn = &self.connectome;
+        let mut gate = vec![false; conn.n()];
+        let mut count = 0usize;
+        for i in 0..conn.n() {
+            let idx = conn.node_meta[i].region_idx;
+            if let Some(r) = conn.region_name(idx) {
+                if pred(r) {
+                    gate[i] = true;
+                    count += 1;
+                }
+            }
+        }
+        self.region_gate = Some(gate);
+        count
+    }
+
+    /// Remove any region selectivity gate (all spiked rows propagate again).
+    pub fn clear_selectivity(&mut self) {
+        self.region_gate = None;
     }
 
     // ------------------------------------------------------- Queen-facing API

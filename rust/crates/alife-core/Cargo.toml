@@ -7,6 +7,7 @@ edition.workspace = true
 alife-common.workspace = true
 alife-worldgen.workspace = true
 alife-evo.workspace = true
+alife-neural.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

@@ -126,6 +126,7 @@ fn policy_share_determinism_and_sum_bound() {
         population: 120,
         policy: Policy::Balanced,
         queen_alive: true,
+        queen_compute_ns: 0,
         avg_bio_energy: BioEnergy::new(50.0),
         demanded_compute: ComputeUnits::new(150.0),
     };
@@ -183,6 +184,7 @@ fn tick_budgets_follow_hardware_advice_and_bounded() {
         tick: 1,
         population: 100,
         queen_alive: true,
+        queen_compute_ns: 0,
         avg_bio_energy: BioEnergy::new(1.0),
         demanded_compute: ComputeUnits::new(0.0),
     };
@@ -214,6 +216,7 @@ fn event_ring_bounded_and_rotates() {
         tick: 0,
         population: 10,
         queen_alive: true,
+        queen_compute_ns: 0,
         avg_bio_energy: BioEnergy::new(1.0),
         demanded_compute: ComputeUnits::new(0.0),
     };
@@ -225,7 +228,7 @@ fn event_ring_bounded_and_rotates() {
             &plan,
             &[ControllerCost {
                 id: tick % 2,
-                label: "expensive".into(),
+                label: "expensive".into(), is_queen: false,
                 cost: ComputeUnits::new(999.0),
             }],
         );
@@ -248,15 +251,16 @@ fn compute_selection_advises_expensive_first_never_lethal() {
         tick: 5,
         population: 10,
         queen_alive: true,
+        queen_compute_ns: 0,
         avg_bio_energy: BioEnergy::new(1.0),
         demanded_compute: ComputeUnits::new(0.0),
     };
     let plan = g.plan(&input);
     let budget = plan.compute_budget.value();
     let costs = vec![
-        ControllerCost { id: 1, label: "cheap".into(), cost: ComputeUnits::new(budget * 0.2) },
-        ControllerCost { id: 2, label: "mid".into(), cost: ComputeUnits::new(budget * 0.4) },
-        ControllerCost { id: 3, label: "expensive".into(), cost: ComputeUnits::new(budget * 0.8) },
+        ControllerCost { id: 1, label: "cheap".into(), is_queen: false, cost: ComputeUnits::new(budget * 0.2) },
+        ControllerCost { id: 2, label: "mid".into(), is_queen: false, cost: ComputeUnits::new(budget * 0.4) },
+        ControllerCost { id: 3, label: "expensive".into(), is_queen: false, cost: ComputeUnits::new(budget * 0.8) },
     ];
     let review = g.review_controllers(&plan, &costs);
     // Total = 1.4*budget. Deferring "expensive" (0.8) leaves 0.6 <= 1.0.
@@ -286,6 +290,8 @@ fn diagnostic_and_config_serde_roundtrip() {
         cpu_budget: 30.0,
         state: GovernorState::Warn,
         decayed_after_ms: 42,
+        mem_ok: true,
+        cpu_ok: true,
     };
     let s = serde_json::to_string(&d).unwrap();
     let d2: GovernorDiagnostic = serde_json::from_str(&s).unwrap();
@@ -309,9 +315,246 @@ fn plan_and_events_serde_roundtrip() {
         shares: SubsystemShares { queen: 0.1, colony: 0.3, ecology: 0.2, weather: 0.1, neural_observatory: 0.2, rendering: 0.1 },
         compute_budget: ComputeUnits::new(150.5),
         tick_budgets: TickBudgets::default(),
+        hardware_state: GovernorState::Green,
         hardware_scaled: false,
+        timing_rebalanced: false,
     };
     let s = serde_json::to_string(&plan).unwrap();
     let p2: AllocationPlan = serde_json::from_str(&s).unwrap();
     assert_eq!(p2, plan);
 }
+
+// --- apply hints: direct-consumption advisory surface ------------------------
+
+/// Synthetic input shared by poll→plan→hints tests.
+fn input(tick: u64, policy: Policy) -> PolicyInput {
+    PolicyInput {
+        tick,
+        population: 128,
+        policy,
+        queen_alive: true,
+        queen_compute_ns: 0,
+        avg_bio_energy: BioEnergy::new(50.0),
+        demanded_compute: ComputeUnits::new(100.0),
+    }
+}
+
+#[test]
+fn poll_plan_apply_hints_happy_path() {
+    let mut g = Governor::new(cfg());
+    let src = || MockSource::new(mem(0.50), 0.0);
+    let diag = g.poll(&src());
+    assert_eq!(diag.state, GovernorState::Green);
+    assert!(diag.mem_ok && diag.cpu_ok);
+
+    let plan = g.plan(&input(1, Policy::Balanced));
+    let hints = plan.to_apply_hints();
+    assert_eq!(hints.step_cap_hint, None, "Green: no step cap");
+    assert_eq!(hints.visual_degrade, 0, "Green: no visual degradation");
+    assert!(!hints.pause_advisory, "Green: never a pause advisory");
+    assert_eq!(plan.hardware_state, GovernorState::Green);
+    assert!(!plan.hardware_scaled);
+
+    // Escalate via sustained over-budget memory.
+    for tick in 2..=64 {
+        let d = g.poll(&MockSource::new(mem(0.97), 0.0));
+        if d.state == GovernorState::Critical {
+            break;
+        }
+        let _ = tick;
+    }
+    assert_eq!(g.poll(&MockSource::new(mem(0.97), 0.0)).state, GovernorState::Critical);
+    let plan = g.plan(&input(70, Policy::Balanced));
+    let hints = plan.to_apply_hints();
+    assert_eq!(hints.step_cap_hint, Some(crate::STEP_CAP_CRITICAL));
+    assert_eq!(hints.visual_degrade, 3);
+    assert!(hints.pause_advisory, "Critical carries the pause advisory");
+    assert_eq!(plan.hardware_state, GovernorState::Critical);
+
+    // Governor::apply_hint (HUD surface) stays consistent.
+    let hint = g.apply_hint();
+    assert_eq!(hint.mode, "critical");
+    assert_eq!(hint.step_cap_hint, hints.step_cap_hint);
+    assert_eq!(hint.visual_degrade, Some(3));
+}
+
+#[test]
+fn apply_hints_deescalation_no_flapping() {
+    let mut g = Governor::new(cfg());
+    g.poll(&MockSource::new(mem(0.87), 0.0)); // Warn
+    let w1 = g.plan(&input(1, Policy::Balanced)).to_apply_hints();
+    assert_eq!(w1.visual_degrade, 1);
+    assert_eq!(w1.step_cap_hint, Some(crate::STEP_CAP_WARN));
+    // Inside the hysteresis band → still Warn → identical hints (no flap).
+    g.poll(&MockSource::new(mem(0.849), 0.0));
+    let w2 = g.plan(&input(2, Policy::Balanced)).to_apply_hints();
+    assert_eq!(w1, w2, "hints must not flap inside the hysteresis band");
+    // Below the band → Green → identical Green hints.
+    g.poll(&MockSource::new(mem(0.79), 0.0));
+    let g1 = g.plan(&input(3, Policy::Balanced)).to_apply_hints();
+    assert_eq!(g1, ApplyHints::default(), "de-escalated hints are the zero hint");
+    // Mapping sanity: only levels 0, 1, 3 are ever emitted by plan
+    // (level 2 is the reserved intermediate, never generated).
+    let emitted = [w1.visual_degrade, w2.visual_degrade, g1.visual_degrade];
+    assert!(emitted.into_iter().all(|l| [0u8, 1, 3].contains(&l)));
+}
+
+#[test]
+fn apply_hints_never_propose_organism_destroy() {
+    // Enumerate every reachable plan (Green/Warn/Critical, every policy):
+    // hints must contain no organism/population destruction surface at all.
+    for policy in [
+        Policy::Balanced,
+        Policy::QueenPriority,
+        Policy::ColonyPriority,
+        Policy::EqualShare,
+        Policy::MaxPopulation,
+        Policy::ComputationalSelection,
+    ] {
+        for mem_frac in [0.5f32, 0.87, 0.97] {
+            let mut g = Governor::new(cfg());
+            for tick in 0..24u64 {
+                g.poll(&MockSource::new(mem(mem_frac), 0.0));
+                let plan = g.plan(&input(tick, policy));
+                let h = plan.to_apply_hints();
+                assert!(h.visual_degrade <= 3);
+                // Only ever a *cap*: a None hint lowers nothing; Some(n) may
+                // only lower app-chosen steps (never a floor, never lethal).
+                if let Some(n) = h.step_cap_hint {
+                    assert!(n >= 1);
+                }
+                assert!(!h.pause_advisory || plan.hardware_state == GovernorState::Critical);
+                let hud = g.apply_hint();
+                assert!(
+                    !hud.reasons.iter().any(|r| r.contains("kill") || r.contains("destroy")),
+                    "reasons must never advertise lethal semantics"
+                );
+                for e in g.events() {
+                    assert!(
+                        e.action_taken != AdvisoryAction::PopulationApprox,
+                        "escalation ladder must never emit a population action"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ladder_never_contains_lethal_or_population_actions() {
+    use crate::hardware::{
+        advisory_ladder as ladder, AdvisoryAction, GovernorState as St,
+    };
+    for state in [St::Green, St::Warn, St::Critical] {
+        for action in ladder(state) {
+            match action {
+                AdvisoryAction::None
+                | AdvisoryAction::SafeWarn
+                | AdvisoryAction::ReduceVisualDetail
+                | AdvisoryAction::ReduceNeuralVisual
+                | AdvisoryAction::BatchControllers
+                | AdvisoryAction::ReduceUpdateHz
+                | AdvisoryAction::SafePause => {}
+                // PopulationApprox is wire-compat only: must never appear as
+                // an escalation step (no population/lethal semantics).
+                AdvisoryAction::PopulationApprox => {
+                    panic!("ladder must never contain a population action")
+                }
+            }
+        }
+    }
+    assert!(ladder(St::Green).is_empty());
+    assert!(ladder(St::Warn).contains(&AdvisoryAction::ReduceVisualDetail));
+    assert!(ladder(St::Critical).contains(&AdvisoryAction::SafePause));
+}
+
+#[test]
+fn boundary_safety_no_lethal_surface() {
+    // Structural: with a fully Critical governor, the entire advisory
+    // surface (plan, hints, ladder, HUD hint, events) contains no operation
+    // that could kill an organism — everything is a capped/advisory scalar.
+    let mut g = Governor::new(cfg());
+    for _ in 0..64 {
+        let d = g.poll(&MockSource::new(mem(0.99), 0.0));
+        if d.state == GovernorState::Critical {
+            break;
+        }
+    }
+    assert_eq!(g.advisory_ladder().last(), Some(&AdvisoryAction::SafePause));
+    let plan = g.plan(&input(99, Policy::QueenPriority));
+    let h = plan.to_apply_hints();
+    // Queen alive + Critical: the queen is NEVER on a destruction path —
+    // the strongest tool here is a step cap of 1 (sim keeps running).
+    assert_eq!(h.step_cap_hint, Some(crate::STEP_CAP_CRITICAL));
+    // The soft population cap is a budget advisory only (0.5× in Critical):
+    // birth-budgeting, never a kill order.
+    assert_eq!(plan.tick_budgets.soft_population_cap, 2_000);
+}
+
+// --- real Windows measurements (this machine; same ranges, not exact) -------
+
+#[test]
+fn sysmetrics_real_returns_plausible_values() {
+    let src = crate::hardware::SysMetrics::new();
+    // Memory: working set of the test process — sane range 1 MiB..=10 GiB.
+    let m = src.try_process_memory_bytes().expect("working-set must be measurable");
+    assert!(
+        m.bytes() >= 1_000_000 && m.bytes() <= 10_750_000_000,
+        "working set implausibly small/large: {} bytes",
+        m.bytes()
+    );
+    // Total physical RAM: sane range 1 GiB..=2 TiB.
+    let ram = src.total_physical_ram().expect("GlobalMemoryStatusEx must succeed");
+    assert!(
+        ram >= 1_073_741_824 && ram <= 2_199_023_255_552,
+        "total RAM implausible: {ram}"
+    );
+    // First CPU sample only opens the window (honest None — no fabrication).
+    assert_eq!(src.try_process_cpu_percent(), None);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // Second sample: a fresh delta → defined percent of one core.
+    let c = src.try_process_cpu_percent().expect("CPU window must open");
+    assert!(c.is_finite() && c >= 0.0, "cpu percent: {c}");
+    // System-wide (HUD-only channel) opens its own window the same way.
+    assert_eq!(src.system_cpu_percent(), None);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let s = src.system_cpu_percent().expect("system window must open");
+    assert!(s.is_finite() && (0.0..=100.0).contains(&s), "sys cpu: {s}");
+    // The production constructor via the dyn trait object must work too.
+    let real = <dyn MeasureSource>::real();
+    let via_dyn = real.try_process_memory_bytes().expect("real() must measure");
+    assert!(via_dyn.bytes() >= 1_000_000);
+}
+
+#[test]
+fn timings_unit_is_milliseconds_everywhere() {
+    // report_timings input unit: milliseconds (documented on
+    // SubsystemTimings); EMA + rebalance only consume *fractions*, so the
+    // unit must not leak into knob changes — here it provably does not.
+    let mut g = Governor::new(cfg());
+    for _ in 0..40 {
+        g.report_timings(&SubsystemTimings {
+            sim_ms: 4.0,
+            render_ms: 5.0,
+            neural_ms: 1.0,
+            ecology_ms: 1.0,
+        });
+    }
+    let plan = g.plan(&input(1, Policy::Balanced));
+    // render fraction ≠ heavy (5/11 ≈ 0.45 < 0.50) → baseline render Hz untouched.
+    assert!(!plan.timing_rebalanced);
+    assert_eq!(plan.tick_budgets.update_hz_rendering, 60.0);
+    // Now render-heavy in ms units → exactly 30 Hz rebalance, once.
+    for _ in 0..60 {
+        g.report_timings(&SubsystemTimings {
+            sim_ms: 1.0,
+            render_ms: 9.0,
+            neural_ms: 0.0,
+            ecology_ms: 0.0,
+        });
+    }
+    let plan = g.plan(&input(2, Policy::Balanced));
+    assert!(plan.timing_rebalanced);
+    assert_eq!(plan.tick_budgets.update_hz_rendering, 30.0);
+}
+

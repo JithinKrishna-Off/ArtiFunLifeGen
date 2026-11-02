@@ -80,6 +80,19 @@ pub struct MotorConfig {
     pub rate_max_hz: f32,
     /// Internal EMA state snapshot.
     pub ema: Vec<f32>,
+    /// Per-channel calibration (K entries, one per DRIVEN channel, K =
+    /// channel count; from the measured calibration probe of a region-bound
+    /// queen run: `baseline` Hz (mean rate across scenes) and `range` Hz
+    /// (measured scene modulation). When present, decode RELATIVE rates:
+    /// channel value = (ema - baseline) / range — baseline subtraction removes
+    /// each real population's tonic offset so well-driven channels decode near
+    /// 0 at rest and open only when the scene drives them (documented measured
+    /// calibration, no fabricated biology). `None` keeps the absolute
+    /// `rate_mid_hz`/`rate_max_hz` decode.
+    #[serde(default)]
+    pub calib_baseline: Option<Vec<f32>>,
+    #[serde(default)]
+    pub calib_range: Option<Vec<f32>>,
 }
 
 impl Default for MotorConfig {
@@ -90,6 +103,8 @@ impl Default for MotorConfig {
             rate_mid_hz: 12.0,
             rate_max_hz: 30.0,
             ema: Vec::new(),
+            calib_baseline: None,
+            calib_range: None,
         }
     }
 }
@@ -105,41 +120,156 @@ impl Default for MotorConfig {
 /// - GATE cells (Intensity, FeedSeek, Emit) are silence-null: zero target at
 ///   zero spikes; decoded value grows from 0 as rate exceeds `rate_mid_hz`,
 ///   saturating at `rate_max_hz` -> 1.
-/// `out_start` = DirX cell index; cell order follows [OutputCell].
+/// `out_start` = DirX cell index; cell order follows [OutputCell]. The
+/// default call decodes the CONTIGUOUS window `[out_start, out_start + 6)`；
+/// region-grounded bindings decode an EXPLICIT cell list (one real neuron
+/// per slot) through [`decode_cells`].
 pub fn decode(
     cfg: &mut MotorConfig,
     spiked: &[u32],
     dt_ms: f32,
     out_start: usize,
 ) -> MotorOutput {
+    let cells = [
+        out_start,
+        out_start + 1,
+        out_start + 2,
+        out_start + 3,
+        out_start + 4,
+        out_start + 5,
+    ];
+    decode_cells(cfg, spiked, dt_ms, &cells)
+}
+
+/// Upper bound (Hz) for an installed per-slot decode calibration range, so a
+/// pathological probe result cannot stretch the decoder into permanent
+/// silence.
+pub const OUTPUT_CALIB_RANGE_MAX_HZ: f32 = 120.0;
+
+/// Decode up to six output slots from POPULATION pools (one pool of real
+/// neurons per FUNCTIONAL channel; the channel rate is the POOL MEAN spike
+/// rate, in Hz/cell). Pool averaging suppresses single-cell noise. The
+/// channel count K = `pools.len()` is whatever the anatomical data justified
+/// (1..=6); body DOFs beyond K decode NEUTRAL (0). Same EMA and calibration
+/// machinery as [`decode_cells`].
+pub fn decode_pools(
+    cfg: &mut MotorConfig,
+    spiked: &[u32],
+    dt_ms: f32,
+    pools: &[&[u32]],
+) -> MotorOutput {
+    let k = pools.len().min(OUTPUT_CELL_COUNT);
+    let mut counts = [0u32; OUTPUT_CELL_COUNT];
+    for &s in spiked {
+        for (j, pool) in pools.iter().take(k).enumerate() {
+            if pool.contains(&s) {
+                counts[j] += 1;
+                break;
+            }
+        }
+    }
+    let rates: Vec<f32> = (0..k)
+        .map(|j| counts[j] as f32 / pools[j].len().max(1) as f32 / dt_ms.max(0.001) * 1000.0)
+        .collect();
+    finish_decode(cfg, &rates, dt_ms)
+}
+
+/// Decode the six output cells from an EXPLICIT binding (region-grounded
+/// queen run mode). `cells[k]` is the real connectome neuron carrying output
+/// channel k; order follows [OutputCell]. Same EMA/rate encoding as [`decode`].
+pub fn decode_cells(
+    cfg: &mut MotorConfig,
+    spiked: &[u32],
+    dt_ms: f32,
+    cells: &[usize; OUTPUT_CELL_COUNT],
+) -> MotorOutput {
+    let mut counts = [0u32; OUTPUT_CELL_COUNT];
+    for &s in spiked {
+        for (k, &c) in cells.iter().enumerate() {
+            if s as usize == c {
+                counts[k] += 1;
+                break;
+            }
+        }
+    }
+    let rates: [f32; OUTPUT_CELL_COUNT] = std::array::from_fn(|k| {
+        counts[k] as f32 / dt_ms.max(0.001) * 1000.0
+    });
+    finish_decode(cfg, &rates, dt_ms)
+}
+
+/// Final EMA advance + bounded decode from per-channel rates in Hz.
+/// `rates.len()` = the number of DRIVEN body DOFs K (1..=6); DOFs beyond K
+/// decode neutral (0) and their EMA is untouched. Single-cell bindings pass
+/// exactly six rates; population bindings pass K = channel count.
+fn finish_decode(cfg: &mut MotorConfig, rates: &[f32], dt_ms: f32) -> MotorOutput {
+    let k = rates.len().min(OUTPUT_CELL_COUNT);
     if cfg.ema.len() != OUTPUT_CELL_COUNT {
         cfg.ema.clear();
         cfg.ema.resize(OUTPUT_CELL_COUNT, cfg.rate_mid_hz);
     }
     let alpha = (dt_ms / cfg.ema_tau_ms.max(1e-6)).clamp(0.0, 1.0);
-    let mut counts = [0u32; OUTPUT_CELL_COUNT];
-    for &s in spiked {
-        if (s as usize) >= out_start && s < (out_start + OUTPUT_CELL_COUNT) as u32 {
-            counts[s as usize - out_start] += 1;
-        }
-    }
-    for (i, &c) in counts.iter().enumerate() {
-        // signed cells are the enum discriminants DirX(0), DirY(1), Turn(3)
+    for (i, &r) in rates.iter().take(k).enumerate() {
+        // signed body DOFs are the fixed slots DirX(0), DirY(1), Turn(3):
+        // full silence carries the tonic baseline (same semantics as the
+        // single-cell window decode); otherwise the rate is the real signal
         let signed = matches!(i, 0 | 1 | 3);
-        let target = if signed && c == 0 {
+        let target = if signed && r == 0.0 {
             cfg.rate_mid_hz
         } else {
-            c as f32 * 1000.0 / dt_ms.max(0.001)
+            r
         };
         cfg.ema[i] += alpha * (target - cfg.ema[i]);
     }
     let mut out = MotorOutput::default();
-    out.move_dir.0 = signed_dev(cfg.ema[OutputCell::DirX as usize], cfg);
-    out.move_dir.1 = signed_dev(cfg.ema[OutputCell::DirY as usize], cfg);
-    out.move_intensity = gate(cfg.ema[OutputCell::Intensity as usize], cfg);
-    out.turn = signed_dev(cfg.ema[OutputCell::Turn as usize], cfg);
-    out.feed_seek = gate(cfg.ema[OutputCell::FeedSeek as usize], cfg);
-    out.emit_signal = gate(cfg.ema[OutputCell::Emit as usize], cfg);
+    if let (Some(base), Some(range)) = (&cfg.calib_baseline, &cfg.calib_range) {
+        if base.len() == k && range.len() == k {
+            // measured calibration decode: relative rates (baseline-subtracted,
+            // range-normalized). Signed channels may go NEGATIVE (relative
+            // inhibition); silence-null channels clamp at 0. Undriven body
+            // DOFs (i >= k) stay at their zero/neutral default.
+            let rel = |i: usize| -> f32 { (cfg.ema[i] - base[i]) / range[i].max(1.0) };
+            if k > 0 {
+                out.move_dir.0 = rel(0).clamp(-1.0, 1.0);
+            }
+            if k > 1 {
+                out.move_dir.1 = rel(1).clamp(-1.0, 1.0);
+            }
+            if k > 2 {
+                out.move_intensity = rel(2).clamp(0.0, 1.0);
+            }
+            if k > 3 {
+                out.turn = rel(3).clamp(-1.0, 1.0);
+            }
+            if k > 4 {
+                out.feed_seek = rel(4).clamp(0.0, 1.0);
+            }
+            if k > 5 {
+                out.emit_signal = rel(5).clamp(0.0, 1.0);
+            }
+            out.clamp_bounded();
+            return out;
+        }
+    }
+    // absolute-rate decode (driven channels only; undriven DOFs 0)
+    if k > 0 {
+        out.move_dir.0 = signed_dev(cfg.ema[0], cfg);
+    }
+    if k > 1 {
+        out.move_dir.1 = signed_dev(cfg.ema[1], cfg);
+    }
+    if k > 2 {
+        out.move_intensity = gate(cfg.ema[2], cfg);
+    }
+    if k > 3 {
+        out.turn = signed_dev(cfg.ema[3], cfg);
+    }
+    if k > 4 {
+        out.feed_seek = gate(cfg.ema[4], cfg);
+    }
+    if k > 5 {
+        out.emit_signal = gate(cfg.ema[5], cfg);
+    }
     out.clamp_bounded();
     out
 }

@@ -99,6 +99,8 @@ struct CacheKey {
     cell: f32,
     dims: (u32, u32),
     wrap: (bool, bool),
+    /// virtual-world margin ring (per side, 0 when closed / wrapped)
+    extra: plan::PlanExtra,
 }
 
 /// one geometry job (a resident rebuild or a fresh chunk entering)
@@ -241,7 +243,10 @@ impl Terrain {
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: depth_format,
                     depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::GreaterEqual,
+                    // standard forward-Z: egui_wgpu clears the shared depth
+                    // attachment to 1.0 (winit.rs pass setup), so fragments
+                    // must pass with the classic LessEqual convention
+                    depth_compare: wgpu::CompareFunction::LessEqual,
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
@@ -382,6 +387,7 @@ impl Terrain {
                     || old.cell != k.cell
                     || old.dims != k.dims
                     || old.wrap != k.wrap
+                    || old.extra != k.extra
             }
             _ => true,
         }
@@ -529,6 +535,10 @@ impl Terrain {
             self.wrap = mesh::edge_wrap(world);
         }
 
+        // virtual-world streaming: open the margin ring on the side(s) the
+        // focus is walking into (wrapped axes never stream)
+        let extra = plan::near_edge_extra(world.width, world.height, focus, self.wrap);
+
         let new_key = CacheKey {
             epoch: world.generation_tag as u64,
             anchor,
@@ -536,6 +546,7 @@ impl Terrain {
             cell,
             dims: (nbx, nby),
             wrap: self.wrap,
+            extra,
         };
         let plan_changed = self.plan_signature_changed(&new_key);
         let dirty_any = self.dirty_full || !self.dirty_rects.is_empty();
@@ -546,7 +557,7 @@ impl Terrain {
 
         // ------------------------------- slow path: reconcile the cache
         let mut planned = Vec::with_capacity(256);
-        plan::build_plan(world, agg, anchor, self.wrap, &mut planned);
+        plan::build_plan_ext(world, agg, anchor, self.wrap, extra, &mut planned);
 
         let cap = plan::verts_of(cell, agg, 1);
         let pool_mismatch = self.pool.as_ref().map(|p| p.cap != cap).unwrap_or(true);
@@ -752,16 +763,71 @@ struct FsIn {
     @location(2) color: vec3<f32>,
 }
 
+// integer hash -> [0,1): wrapping u32 mix over the two cell coords; no
+// textures/samplers needed for this material
+fn h2i(x: i32, z: i32) -> f32 {
+    var h = bitcast<u32>(x) * 73856093u ^ bitcast<u32>(z) * 19349663u;
+    h ^= h << 13u;
+    h ^= h >> 17u;
+    h ^= h << 5u;
+    return f32(h & 0xFFFFFFu) / 16777216.0;
+}
+
+// smooth value noise from hashed integer cells on the world XZ plane
+fn vnoise(x: f32, z: f32, cell: f32) -> f32 {
+    let fx = x / cell;
+    let fz = z / cell;
+    let ix = floor(fx);
+    let iz = floor(fz);
+    let tx = fx - ix;
+    let tz = fz - iz;
+    let sx = tx * tx * (3.0 - 2.0 * tx);
+    let sz = tz * tz * (3.0 - 2.0 * tz);
+    let a = h2i(i32(ix), i32(iz));
+    let b = h2i(i32(ix) + 1, i32(iz));
+    let u = h2i(i32(ix), i32(iz) + 1);
+    let w = h2i(i32(ix) + 1, i32(iz) + 1);
+    return mix(mix(a, b, sx), mix(u, w, sx), sz);
+}
+
 @fragment
 fn fs(in: FsIn) -> @location(0) vec4<f32> {
     let sun_dir = normalize(vec3(0.35, 0.55, 0.85));
     let lambert = clamp(dot(normalize(in.normal), sun_dir), 0.0, 1.0);
-    var c = in.color * (0.30 + 0.80 * lambert);
+
+    // --- land material: cheap 2-octave hash value-noise over world XZ
+    // (coarse cells ~48 units, fine cells ~7 units). The noise mask
+    // modulates the ground GREEN tint: at mask patches a grass tone mixes
+    // over the soil tone (~40% at mask peaks, fading to 0 at mask valleys)
+    // so grass and ground read as one continuous lawn. Subtle value
+    // variation +-0.08 (fine octave) and hue tilt <= +-0.04 (coarse
+    // octave). Moisture/wetness/hazard vertex colors stay untouched: the
+    // green mix applies only to green-dominant land and fully fades under
+    // the water/wet shading below. Far fog is unchanged.
+    let n_coarse = vnoise(in.world.x, in.world.z, 48.0);
+    let n_fine = vnoise(in.world.x, in.world.z, 7.0);
+    let mask = 0.65 * n_coarse + 0.35 * n_fine;
+    let hn = in.world.y / 46.0;
+    let under = clamp((0.42 - hn) * 6.5, 0.0, 1.0);
+    let greenness = clamp(in.color.g * 2.2 - (in.color.r + in.color.b), 0.0, 1.0);
+    let lawn = clamp((mask - 0.28) * 2.6, 0.0, 1.0) * greenness * (1.0 - under);
+    let lit = 0.30 + 0.80 * lambert;
+    let green_mix = mix(vec3(1.0), vec3(0.78, 1.24, 0.60), 0.40 * lawn);
+    var c = in.color * green_mix * lit;
+    // subtle variation: multiplicative value tilt, then a tiny hue-ish
+    // channel rotation bound to +-0.04 of the green channel delta
+    let jitter = (n_fine - 0.5) * 2.0;
+    c *= 1.0 + 0.08 * jitter;
+    let hue_t = (n_coarse - 0.5) * 2.0;
+    c = vec3(
+        c.r + (0.04 * hue_t) * (c.g - c.r),
+        c.g,
+        c.b + (0.04 * hue_t) * (c.b - c.g) * 0.5,
+    );
+
     // underwater / shoreline tint where the height is close to/below sea
     // level; the tint is modulated by a slow wave over world position and
     // uniform time (world_wh_time_flash.z) so open water shimmers
-    let hn = in.world.y / 46.0;
-    let under = clamp((0.42 - hn) * 6.5, 0.0, 1.0);
     let wave = sin(in.world.x * 0.11 + cam.world_wh_time_flash.z * 1.9)
         * sin(in.world.z * 0.13 - cam.world_wh_time_flash.z * 1.4);
     c = mix(c, vec3(0.20, 0.48, 0.56), under * (0.70 + 0.15 * wave));

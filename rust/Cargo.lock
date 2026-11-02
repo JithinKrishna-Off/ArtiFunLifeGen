@@ -152,6 +152,7 @@ dependencies = [
  "alife-common",
  "alife-data",
  "alife-evo",
+ "alife-neural",
  "alife-worldgen",
  "serde",
  "serde_json",
@@ -181,7 +182,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sysinfo",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -192,6 +193,7 @@ dependencies = [
  "memmap2",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 
@@ -212,6 +214,8 @@ dependencies = [
  "alife-common",
  "alife-core",
  "alife-data",
+ "alife-governor",
+ "alife-neural",
  "alife-render",
  "alife-view3d",
  "alife-worldgen",
@@ -2075,15 +2079,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ntapi"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
-dependencies = [
- "winapi",
-]
-
-[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2915,6 +2910,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3114,21 +3120,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.30.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a5b4ddaee55fb2bea2bf0e5000747e5f5c0de765e5a5ff87f4cd106439f4bb3"
-dependencies = [
- "cfg-if",
- "core-foundation-sys",
- "libc",
- "ntapi",
- "once_cell",
- "rayon",
- "windows 0.52.0",
 ]
 
 [[package]]

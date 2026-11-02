@@ -64,7 +64,7 @@ impl SubsystemShares {
     /// Deterministic normalization: if the raw sum drifted above 1.0 (f32
     /// rounding or a hand-tuned overshoot), scale every share by `1/sum`.
     /// Below 1.0 is allowed (slack is intentional, e.g. MaxPopulation).
-    fn normalized(mut self) -> Self {
+    pub(crate) fn normalized(mut self) -> Self {
         let s = self.sum();
         if s > 1.0 {
             for f in [&mut self.queen, &mut self.colony, &mut self.ecology, &mut self.weather, &mut self.neural_observatory, &mut self.rendering] {
@@ -83,7 +83,16 @@ pub struct PolicyInput {
     pub population: u32,
     /// Policy for this plan (coordinator-owned; can change per tick).
     pub policy: Policy,
+    /// Is the queen organism alive this tick? Additive, serde-default for
+    /// backward compatibility of older serialized inputs.
+    #[serde(default)]
     pub queen_alive: bool,
+    /// How much work (nanoseconds) the queen controller consumed in the
+    /// last tick, as reported by the coordinator. Pure telemetry used in
+    /// scheduling-event reasons so the observatory can see queen load;
+    /// it never alters budgets by itself. Additive, serde-default.
+    #[serde(default)]
+    pub queen_compute_ns: u128,
     /// Colony-average bio energy (metadata for heuristics; separate unit
     /// space from CU and hardware).
     pub avg_bio_energy: BioEnergy,
@@ -117,6 +126,119 @@ impl Default for TickBudgets {
             controller_batch_size: 256,
             soft_population_cap: 4_000,
         }
+    }
+}
+
+/// Per-frame timing report the coordinator feeds via
+/// `Governor::report_timings`. Unit: **milliseconds** (documented once
+/// here, used consistently by every getter/EMA in this crate). Cheap to
+/// build; the governor keeps a rolling EMA per field. All zero is the
+/// "never reported / nothing measured" sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct SubsystemTimings {
+    pub sim_ms: f32,
+    pub render_ms: f32,
+    pub neural_ms: f32,
+    pub ecology_ms: f32,
+}
+
+/// Rebalance thresholds and factors for [`TickBudgets`] — one documented
+/// place for the timing-rebalance formulas operated by
+/// `Governor::plan`:
+///
+/// * `f_i = timing_ema_i / Σ(timing_ema)` — a subsystem's share of measured
+///   frame work, each in `[0, 1]` (denominator strictly positive; no NaN).
+/// * **render heavy** (`f_render >= 0.50`): rendering drops to exactly
+///   30 Hz (`update_hz_rendering = 30.0`), clamped to `1..=240`.
+/// * **neural heavy** (`f_neural >= 0.45`): neural-observatory Hz scaled by
+///   `0.7` (neural heavy → lower neural Hz), clamped to `0.5..=60`.
+/// * **sim heavy** (`f_sim >= 0.60`): *no knob change* — sim cadence is a
+///   contracts-grade constant; the governor escalates an advisory
+///   (`ReduceUpdateHz`) for the coordinator to act on instead.
+/// * ecology timing joins only the Σ denominator; no dedicated knob exists
+///   for it today (honestly documented gap).
+/// * `SubsystemShares` (the policy split) is **never** touched by timings —
+///   the rebalance respects the policy split by construction.
+pub(crate) mod timing_rebalance {
+    pub const RENDER_HEAVY_FRACTION: f32 = 0.50;
+    pub const NEURAL_HEAVY_FRACTION: f32 = 0.45;
+    pub const SIM_HEAVY_FRACTION: f32 = 0.60;
+    pub const RENDER_HEAVY_HZ: f32 = 30.0;
+    pub const NEURAL_HEAVY_SCALE: f32 = 0.7;
+}
+
+impl TickBudgets {
+    /// Timing-derived rebalance: deterministic from the input fractions,
+    /// every produced field passes [`TickBudgets::clamped`] (no NaN: all
+    /// arithmetic is over non-negative finite values with a strictly
+    /// positive divisor).
+    pub(crate) fn rebalanced_by_timings(mut self, f: &TimingFractions) -> Self {
+        use timing_rebalance::*;
+        if f.render >= RENDER_HEAVY_FRACTION {
+            self.update_hz_rendering = RENDER_HEAVY_HZ;
+        }
+        if f.neural >= NEURAL_HEAVY_FRACTION {
+            self.update_hz_neural_observatory *= NEURAL_HEAVY_SCALE;
+        }
+        // f.sim >= SIM_HEAVY_FRACTION: intentionally no change here (see
+        // module docs); the Governor escalates an advisory event instead.
+        self.clamped()
+    }
+}
+
+/// Normalized fractions of measured frame work per subsystem, computed
+/// from the timing EMAs. All in `[0, 1]` and finite; `None` before the
+/// first non-empty timing report.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TimingFractions {
+    pub sim: f32,
+    pub render: f32,
+    pub neural: f32,
+    pub ecology: f32,
+}
+
+impl TimingFractions {
+    pub(crate) fn from_ema(t: &TimingEma) -> Option<Self> {
+        let total = t.sim + t.render + t.neural + t.ecology;
+        if total <= 0.0 {
+            return None;
+        }
+        let norm = |v: f64| (v / total) as f32;
+        Some(Self {
+            sim: norm(t.sim).clamp(0.0, 1.0),
+            render: norm(t.render).clamp(0.0, 1.0),
+            neural: norm(t.neural).clamp(0.0, 1.0),
+            ecology: norm(t.ecology).clamp(0.0, 1.0),
+        })
+    }
+}
+
+/// Rolling EMA of per-subsystem frame timings (milliseconds, f64 internal
+/// precision). Warm-up is documented: starting from all zeros, the EMA
+/// approaches the true value geometrically — after `k` reports the residual
+/// is `(1 - α)^k` of the initial gap (α = `GovernorConfig::timing_ema_alpha`,
+/// default 0.25). Inputs are sanitized: non-finite or negative values are
+/// treated as 0.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct TimingEma {
+    pub sim: f64,
+    pub render: f64,
+    pub neural: f64,
+    pub ecology: f64,
+}
+
+impl TimingEma {
+    pub(crate) fn update(&mut self, t: &SubsystemTimings, alpha: f32) {
+        let a = alpha as f64;
+        let sanitize = |v: f32| -> f64 {
+            let v = v as f64;
+            if v.is_finite() && v >= 0.0 { v } else { 0.0 }
+        };
+        let blend = |e: f64, raw: f64| a * raw + (1.0 - a) * e;
+        self.sim = blend(self.sim, sanitize(t.sim_ms));
+        self.render = blend(self.render, sanitize(t.render_ms));
+        self.neural = blend(self.neural, sanitize(t.neural_ms));
+        self.ecology = blend(self.ecology, sanitize(t.ecology_ms));
     }
 }
 
@@ -159,8 +281,74 @@ pub struct AllocationPlan {
     pub compute_budget: ComputeUnits,
     /// Hardware-advice-derived tick knobs.
     pub tick_budgets: TickBudgets,
+    /// Hardware state this plan was scaled from (serde-default for older
+    /// payloads). Source for [`AllocationPlan::to_apply_hints`].
+    #[serde(default)]
+    pub hardware_state: GovernorState,
     /// True when hardware advice degraded the knobs vs the green baseline.
     pub hardware_scaled: bool,
+    /// True when the timing EMA triggered a knob rebalance this tick.
+    #[serde(default)]
+    pub timing_rebalanced: bool,
+}
+
+/// Directly applicable advisory hints an app agent can consume without
+/// touching any other governor API. Pure data — the agent applies or
+/// declines every field.
+///
+/// # Documented mapping (level 0 = none → 3 = strongest)
+///
+/// | Plan state | `step_cap_hint` | `visual_degrade` | `pause_advisory` |
+/// |---|---|---|---|
+/// | Green | `None` (no restriction) | `0` (full fidelity) | `false` |
+/// | Warn | `Some(2)` (`min(app_default, 2)` steps/frame) | `1` (reduce 2D/3D visual detail) | `false` |
+/// | Critical | `Some(1)` (min single sim step/frame) | `3` (max: + neural observatory, batched controllers, lowered Hz) | `true` (last-resort advisory only; applying it is the coordinator's decision) |
+///
+/// # Safety contract
+/// There is **no** field that can ever designate an organism (or any
+/// population) for destruction — hints can only cap per-frame sim steps,
+/// degrade visuals, or suggest a pause. Birth/population budgeting is
+/// advisory via `TickBudgets::soft_population_cap` (never lethal).
+/// Enforced by `tests::apply_hints_never_propose_organism_destroy` and
+/// `tests::ladder_never_contains_lethal_or_population_actions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct ApplyHints {
+    /// Cap on simulation steps per rendered frame (`None` = no
+    /// restriction). Apply as a cap (`min`), never a floor — the hint can
+    /// only *lower* app-chosen work.
+    pub step_cap_hint: Option<u64>,
+    /// Visual degradation level 0..=3 (0 = none, 3 = strongest; see the
+    /// table above).
+    pub visual_degrade: u8,
+    /// `true` only in Critical: the coordinator *may* pause the sim loop
+    /// (menus etc.) as the last resort. Advisory only — simulation is never
+    /// forced to stop by the governor.
+    pub pause_advisory: bool,
+}
+
+impl AllocationPlan {
+    /// Direct-consumption hints for app agents (see [`ApplyHints`] for the
+    /// documented mapping). Pure function of the plan (deterministic):
+    /// same plan → same hints.
+    pub fn to_apply_hints(&self) -> ApplyHints {
+        match self.hardware_state {
+            GovernorState::Green => ApplyHints {
+                step_cap_hint: None,
+                visual_degrade: 0,
+                pause_advisory: false,
+            },
+            GovernorState::Warn => ApplyHints {
+                step_cap_hint: Some(crate::governor::STEP_CAP_WARN),
+                visual_degrade: 1,
+                pause_advisory: false,
+            },
+            GovernorState::Critical => ApplyHints {
+                step_cap_hint: Some(crate::governor::STEP_CAP_CRITICAL),
+                visual_degrade: 3,
+                pause_advisory: true,
+            },
+        }
+    }
 }
 
 impl Policy {
@@ -186,6 +374,18 @@ impl Policy {
             _ => cfg_base,
         }
     }
+
+    /// Queen guarantee: only `QueenPriority` carries one — when the queen
+    /// is alive, the queen's dispatch-attention share is never below this
+    /// fraction (defensively enforced in `Governor::plan` even though the
+    /// hand-tuned share already equals it). All other policies guarantee
+    /// nothing about the queen (`None`).
+    pub(crate) fn guaranteed_queen_share(self) -> Option<f32> {
+        match self {
+            Policy::QueenPriority => Some(0.40),
+            _ => None,
+        }
+    }
 }
 
 /// One controller's CU cost for a tick, tagged by the coordinator.
@@ -195,6 +395,13 @@ pub struct ControllerCost {
     pub id: u64,
     pub label: String,
     pub cost: ComputeUnits,
+    /// True for the queen controller. Queen costs are **exempt** from
+    /// computational selection: never advised for deferral and never
+    /// counted against the ordinary-controller CU budget (which is the
+    /// `0.6×`-shrunken budget under `ComputationalSelection`). Additive,
+    /// serde-default so older serialized rows load as ordinary controllers.
+    #[serde(default)]
+    pub is_queen: bool,
 }
 
 /// The result of a compute-starvation review: controllers advised for
@@ -210,21 +417,32 @@ pub struct ComputeReview {
 /// Review CU demand against a plan's budget when the policy opts into
 /// computational selection: greedily defer the most expensive controllers
 /// (deterministic ties broken by id) until the remaining demand fits.
-/// Purely advisory; every advised deferral is recorded by `Governor`.
+/// Queen-tagged controllers ([`ControllerCost::is_queen`]) are exempt:
+/// they are never advised for deferral and do not consume the ordinary
+/// budget. Purely advisory; every advised deferral is recorded by
+/// `Governor`.
 pub fn compute_starvation_review(
     policy: Policy,
     budget: ComputeUnits,
     costs: &[ControllerCost],
 ) -> ComputeReview {
-    if !matches!(policy, Policy::ComputationalSelection) || costs.is_empty() {
+    if !matches!(policy, Policy::ComputationalSelection) {
         return ComputeReview { advised_deferral: Vec::new() };
     }
-    let total: ComputeUnits = costs.iter().map(|c| c.cost).sum();
+    // Queen exemption: queen controllers are filtered out entirely — their
+    // cost is admitted by guarantee and cannot consume/matter for this
+    // review.
+    let ordinary: Vec<ControllerCost> =
+        costs.iter().filter(|c| !c.is_queen).cloned().collect();
+    if ordinary.is_empty() {
+        return ComputeReview { advised_deferral: Vec::new() };
+    }
+    let total: ComputeUnits = ordinary.iter().map(|c| c.cost).sum();
     if total.value() <= budget.value() {
         return ComputeReview { advised_deferral: Vec::new() };
     }
     // Deterministic: cost descending, id ascending on ties.
-    let mut sorted: Vec<&ControllerCost> = costs.iter().collect();
+    let mut sorted: Vec<&ControllerCost> = ordinary.iter().collect();
     sorted.sort_by(|a, b| b.cost.value().partial_cmp(&a.cost.value()).unwrap_or(std::cmp::Ordering::Equal).then(a.id.cmp(&b.id)));
     let mut remaining = total;
     let mut advised = Vec::new();

@@ -34,6 +34,12 @@ pub const TAIL_VCOUNT: u32 = 1152; // 2 tails x 16 rings x 6 sides
 pub const QUAD_VBASE: u32 = TAIL_VBASE + TAIL_VCOUNT;
 pub const QUAD_VCOUNT: u32 = 6;
 
+pub const QUEEN_VBASE: u32 = QUAD_VBASE + QUAD_VCOUNT;
+/// Queen template vertex count (morph_queen: giant-insect queen — head,
+/// thorax, banded abdomen, 6 jointed legs, antennae, eyes, mandibles, 2
+/// wing quads — appended after the billboard quad in the uploaded soup).
+pub const QUEEN_VCOUNT: u32 = super::queen::QUEEN_VCOUNT;
+
 /// One template vertex: loc0 = vec4 (local pos, 0), loc1 = (param, id).
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -116,7 +122,9 @@ fn mid(cache: &mut std::collections::HashMap<u64, u32>, pos: &mut Vec<[f32; 3]>,
 }
 
 /// Subdivided unit icosphere as soup triangle positions (3 verts / face).
-fn sphere_soup(depth: u32) -> Vec<[f32; 3]> {
+/// Public so the queen template (morph_queen) reuses the exact same
+/// base geometry family — no new geometry pipeline is introduced.
+pub fn sphere_soup(depth: u32) -> Vec<[f32; 3]> {
     let (mut pos, mut idx) = ico_base();
     let mut cache: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     for _ in 0..depth {
@@ -246,18 +254,21 @@ fn push_tail(out: &mut Vec<TVert>, cp: &[[f32; 3]; 4], id: f32) {
     }
 }
 
-// flagella bezier chords (body-radius units); extend backward (-X = behind)
+// flagella bezier chords (body-radius units); extend backward (-X = behind).
+// Re-scaled for the ORGANISM_UNIT_RADIUS tiny rebase: reach ~2.5 body radii
+// (was ~9.8) so the whole flagellate silhouette stays ~1.4 world units at
+// size 1, and strands stay thin capsules hugging the tapered body.
 const TAIL_A: [[f32; 3]; 4] = [
-    [-0.85, 0.0, 0.0],
-    [-2.6, 0.45, 0.35],
-    [-6.0, -0.25, 0.55],
-    [-9.5, 0.4, 0.1],
+    [-0.60, 0.0, 0.0],
+    [-1.35, 0.20, 0.16],
+    [-2.05, -0.12, 0.28],
+    [-2.48, 0.22, 0.06],
 ];
 const TAIL_B: [[f32; 3]; 4] = [
-    [-0.85, 0.1, -0.1],
-    [-2.5, -0.35, 0.45],
-    [-6.2, 0.3, -0.5],
-    [-9.8, -0.3, 0.25],
+    [-0.60, 0.08, -0.06],
+    [-1.30, -0.18, 0.24],
+    [-1.95, 0.16, -0.26],
+    [-2.60, -0.15, 0.10],
 ];
 
 // ------------------------------------------------------------- assembly
@@ -294,3 +305,4 @@ pub fn build() -> Templates {
     debug_assert_eq!(quad.len() as u32, QUAD_VCOUNT);
     Templates { shell, tail, quad }
 }
+

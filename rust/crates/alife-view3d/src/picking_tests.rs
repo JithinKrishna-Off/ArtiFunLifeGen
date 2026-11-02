@@ -207,3 +207,159 @@ fn degenerate_inputs_return_none_not_nan() {
     // de-projected ray of an affine matrix still lands somewhere snap-decidable
     assert!(ray_dir(&Mat4::from_cols_array_2d(&vp), eye, (800.0, 600.0), (0.0, 0.0)).is_some());
 }
+
+// ------------------------------------------------ hover API
+
+#[test]
+fn hover_hits_and_misses_exactly_like_pick() {
+    let eye = Vec3::new(100.0, 200.0, 100.0);
+    let orgs = [inst(108.0, 100.0, 1.0, 1.0), inst(101.5, 101.5, 1.0, 1.0)];
+    let (vp, vp_pos) = cam_of(eye, Vec3::new(eye.x, 0.0, eye.z), Vec3::Z);
+    let hit = hover_org(&vp, vp_pos, vp_rect(), center_mouse(), (100.0, 100.0), 0.0, &orgs)
+        .expect("hover hit");
+    assert_eq!(hit.org_index, 1);
+    assert!(hit.dist.is_finite() && hit.dist > 0.0, "ray travel dist");
+    assert!(hit.hit_dist.is_finite() && hit.hit_dist <= 400.0, "planar miss");
+    // same aim miss: hover agrees with pick's None
+    assert_eq!(
+        hover_org(&vp, vp_pos, vp_rect(), center_mouse(), (0.0, 0.0), 0.0, &[]),
+        None
+    );
+    let (vp2, vp_pos2) = cam_of(Vec3::new(100.0, 100.0, 100.0), Vec3::new(100.0, 0.0, 100.0), Vec3::Z);
+    assert_eq!(
+        hover_org(&vp2, vp_pos2, vp_rect(), center_mouse(), (100.0, 100.0), 0.0, &[inst(160.0, 100.0, 1.0, 1.0)]),
+        None
+    );
+    // corpses are skipped on the hover path too
+    assert_eq!(
+        hover_org(&vp, vp_pos, vp_rect(), center_mouse(), (100.0, 100.0), 0.0, &[inst(108.0, 100.0, 1.0, 0.0)]),
+        None
+    );
+    // winner index is identical to the click path
+    assert_eq!(
+        hover_org(&vp, vp_pos, vp_rect(), center_mouse(), (100.0, 100.0), 0.0, &orgs).unwrap().org_index as u32,
+        pick_org(&vp, vp_pos, vp_rect(), center_mouse(), (100.0, 100.0), 0.0, &orgs).unwrap()
+    );
+}
+
+// ------------------------------------------------ queen tolerance
+
+fn queenly(x: f32, y: f32, size: f32) -> OrgInst {
+    let mut o = inst(x, y, size, 1.0);
+    o.is_queen = 1;
+    o.visual_radius_mul = crate::morph::decomp::QUEEN_SCALE;
+    o
+}
+
+#[test]
+fn queen_mental_radius_uses_the_queen_body_formula() {
+    let o = queenly(0.0, 0.0, 1.0);
+    // queen body radius morph_decomp math: 5.5 * size * (0.62 + 0.38*energy) * QUEEN_SCALE
+    // (= QUEEN_UNIT_RADIUS * size * tf after the giant rebalance)
+    let expect = 5.5 * o.size.clamp(0.3, 2.0) * (0.62 + 0.38 * o.energy) * crate::morph::decomp::QUEEN_SCALE;
+    assert!((pick_radius(&o) - expect).abs() < 1e-4);
+    // hard cap holds
+    let mut big = queenly(0.0, 0.0, 2.0);
+    big.energy = 1.0;
+    assert!(pick_radius(&big) <= MAX_PICK_BODY_R);
+}
+
+#[test]
+fn ordinary_pick_radius_stays_the_size_clamp_bit_identical() {
+    for (size, mul) in [(1.0_f32, 0.0_f32), (1.3, 0.0), (2.2, 0.0), (1.0, 1.0), (1.0, f32::NAN)] {
+        let mut o = inst(0.0, 0.0, size, 1.0);
+        o.visual_radius_mul = mul;
+        assert_eq!(pick_radius(&o), size.clamp(0.6, 2.2), "mul={mul}");
+    }
+}
+
+#[test]
+fn queen_crown_clicks_land_on_the_widened_ring() {
+    // eye at 150 world units: base tol = 7.5; queen ring = 7.5 * pick_radius
+    let eye = Vec3::new(0.0, 150.0, 0.0);
+    let (vp, vp_pos) = cam_of(eye, Vec3::ZERO, Vec3::Z);
+    // giant rebalance: probe the crown of a full-grown queen (trait size 2)
+    // => pick ring ~= QUEEN_UNIT_RADIUS * 2 * turgor ~= 4.9 world units,
+    // far past the ordinary size-clamp proxy (2.2)
+    let q = queenly(0.0, 0.0, 2.0);
+    let pick_radius_q = pick_radius(&q);
+    assert!(pick_radius_q > 2.2, "queen widened past the size clamp");
+    // a click INSIDE the queen's widened ring but outside any ordinary ring
+    let click = 7.5 * pick_radius_q * 0.9;
+    assert_eq!(
+        hover_org(&vp, vp_pos, vp_rect(), center_mouse(), (0.0, 0.0), 0.0, &[queenly(click, 0.0, 2.0)]).map(|c| c.org_index),
+        Some(0),
+        "queen ring reaches further than any ordinary body"
+    );
+    // same offset with an ordinary mul=1.0 org of identical traits: MISS
+    let mut ord = inst(click, 0.0, 1.0, 1.0);
+    ord.visual_radius_mul = 1.0;
+    assert_eq!(
+        hover_org(&vp, vp_pos, vp_rect(), center_mouse(), (0.0, 0.0), 0.0, &[ord]),
+        None
+    );
+}
+
+// ------------------------------------------------ diagnostics
+
+#[test]
+fn diag_sanity_no_nan_capped_and_selected_mirrors() {
+    let eye = Vec3::new(100.0, 200.0, 100.0);
+    let mut orgs: Vec<OrgInst> = vec![
+        inst(108.0, 100.0, 1.0, 1.0),
+        inst(101.5, 101.5, 1.0, 1.0),
+        inst(130.0, 130.0, 1.0, 1.0),
+    ];
+    push_big_crowd(&mut orgs, 24);
+    let (vp, vp_pos) = cam_of(eye, Vec3::new(eye.x, 0.0, eye.z), Vec3::Z);
+    let (sel, diag) =
+        pick_org_with_diag(&vp, vp_pos, vp_rect(), center_mouse(), (100.0, 100.0), 0.0, &orgs);
+    assert!(diag.candidates.len() <= MAX_DIAG_CANDIDATES);
+    assert!(diag.candidates.len() > 0, "crowd under the crosshair hits");
+    // diag.selected mirrors the returned pick and is the nearest hit
+    assert_eq!(diag.selected, sel, "diag.selected mirrors the returned pick");
+    match (sel, diag.candidates.first()) {
+        (Some(i), Some(c)) => assert_eq!(i, c.org_index, "winner is the nearest hit"),
+        (None, None) => {}
+        _ => panic!("selected/candidates must agree"),
+    }
+    for c in &diag.candidates {
+        assert!(c.dist.is_finite() && c.dist > 0.0);
+        assert!(c.hit_dist.is_finite() && c.hit_dist >= 0.0);
+        assert!(c.org_index < orgs.len());
+    }
+    // nearest-first ordering by planar hit distance
+    for w in diag.candidates.windows(2) {
+        assert!(w[0].hit_dist <= w[1].hit_dist, "candidates sorted nearest-first");
+    }
+    assert!(diag.ray_dir.iter().all(|v| v.is_finite()));
+    let norm = Vec3::from_array(diag.ray_dir);
+    assert!((norm.length() - 1.0).abs() < 1e-3, "ray normalized");
+    assert!(diag.hit_radius.is_finite() && diag.hit_radius >= 2.0);
+    assert!(diag.ground_h.is_finite());
+}
+
+#[test]
+fn diag_empty_or_degenerate_ray_is_clean() {
+    let eye = Vec3::new(0.0, 100.0, 0.0);
+    let (vp, vp_pos) = cam_of(eye, Vec3::ZERO, Vec3::Z);
+    let (sel, diag) = pick_org_with_diag(&vp, vp_pos, vp_rect(), center_mouse(), (0.0, 0.0), 0.0, &[]);
+    assert_eq!(sel, None);
+    assert!(diag.candidates.is_empty());
+    assert!(diag.hit_radius.is_finite());
+    assert!(diag.ray_dir.iter().all(|v| v.is_finite()));
+    assert!(diag.ground_h.is_finite());
+    // out-of-viewport pointer: no hit, no NaN
+    let (sel, diag) = pick_org_with_diag(&vp, vp_pos, vp_rect(), px(5000.0, 0.0), (0.0, 0.0), 0.0, &[inst(0.0, 0.0, 1.0, 1.0)]);
+    assert_eq!(sel, None);
+    assert!(diag.candidates.is_empty());
+    assert!(diag.ray_dir.iter().all(|v| v.is_finite()));
+}
+
+fn push_big_crowd(out: &mut Vec<OrgInst>, ring: usize) {
+    for i in 0..ring {
+        let a = i as f32 / ring as f32 * std::f32::consts::TAU;
+        out.push(inst(100.0 + a.cos() * 12.0, 100.0 + a.sin() * 12.0, 1.0, 1.0));
+    }
+}
+

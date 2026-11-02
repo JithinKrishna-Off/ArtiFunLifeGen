@@ -2,8 +2,10 @@
 //! fixed-step simulation accumulator.
 
 use crate::dialogs::{self, Dialog};
+use crate::panels_brain;
 use crate::panels_editor;
 use crate::panels_experiments;
+use crate::panels_governor;
 use crate::panels_inspector;
 use crate::panels_screens;
 use crate::panels_stats::{HistCache, StatsCache};
@@ -16,13 +18,21 @@ use crate::god_api::{GodCache, GodLogEntry, GodTool, WeatherSnapshot};
 use crate::widgets::{ToastKind, Toasts};
 use alife_common::{
     persist::{HistoryBuffer, WorldSave},
-    InteractionMode, LineageRecord, SimParams, WorldGenConfig,
+    InteractionMode, Organism, LineageRecord, SimParams, WorldGenConfig,
 };
-use alife_core::{SimApi, Simulation, DT};
+use alife_core::{
+    queen::QueenBrainFactory, queen_bridge as qb, SimApi, Simulation, DT,
+};
+use alife_governor::{
+    ApplyHints, BioEnergy, ComputeUnits, Governor, GovernorConfig, GovernorDiagnostic, Policy,
+    PolicyInput, SubsystemTimings, SysMetrics,
+};
+use alife_neural::connectome::Connectome;
+use egui::{Context, Key};
 use alife_data::DataStore;
 use alife_render::{WeatherLayer, WorldView};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Render/perf setting chosen in Settings.
@@ -167,23 +177,37 @@ pub const MAX_STEPS_PER_FRAME: u64 = 2048;
 /// Smoothed achieved-rate samples (one per 0.5 s measurement window).
 const RATE_RING_N: usize = 8;
 
-/// One Instant-checked slow UI clock (10 Hz) for every throttled read:
-/// weather snapshots, intervention log, cached toolbar/status strings.
-#[derive(Default)]
-struct Hz10Clock {
+/// One Instant-checked slow clock (configurable period) for throttled work:
+/// 10 Hz shell reads, 1 Hz governor polls, 10 Hz queen exhibit checks.
+struct HzClock {
     last: Option<Instant>,
+    period: f32,
 }
 
-impl Hz10Clock {
+impl HzClock {
+    fn new(period: f32) -> Self {
+        Self { last: None, period }
+    }
+
     fn due(&mut self) -> bool {
         let now = Instant::now();
         let due = self
             .last
-            .map_or(true, |l| now.duration_since(l).as_secs_f32() >= 0.1);
+            .map_or(true, |l| now.duration_since(l).as_secs_f32() >= self.period);
         if due {
             self.last = Some(now);
         }
         due
+    }
+}
+
+/// Human label for a governor visual-degrade level (0..=3).
+fn governor_degrade_label(level: u8) -> &'static str {
+    match level {
+        0 => "none",
+        1 => "warn level 1",
+        2 => "intermediate level 2",
+        _ => "max level 3",
     }
 }
 
@@ -211,6 +235,23 @@ pub fn random_seed() -> u32 {
         .unwrap_or(1337)
         | 1
 }
+
+// =========================================================== queen wiring
+//
+// Wired against the CURRENT `alife_core::queen_bridge` API: the artifact is
+// loaded/verified once (`connectome_binary::load` + the same
+// `QueenBrainAdapter::new_from_connectome(.., 0)` probe core's
+// `register_default_factory` uses), then registered on the sim via core's own
+// `MaleCnsQueenBrainFactory`. The app keeps the connectome `Arc` so a crown
+// can plug the brain directly (`crown_queen` starts the reign with
+// `brain: None`; nothing in core auto-plugs). Missing artifact ⇒ honest
+// "no brain plugged" state, no fixture fallback, retries stay silent.
+
+/// Artifact subdirectory candidate name (under data dir and exe dir).
+pub const QUEEN_CONNECTOMES_DIR: &str = "connectomes";
+/// Repo-side debug artifact directory (dev runs pull the 166k exhibit from
+/// `<repo>/appdata/malecns166k/queen-subnetwork-166k.alifecns`).
+pub const QUEEN_REPO_ARTIFACT_DIR: &str = "appdata/malecns166k";
 
 /// The whole running application.
 pub struct AlifeApp {
@@ -300,7 +341,7 @@ pub struct AlifeApp {
     pub hist_cache: Option<HistCache>,
 
     // memory-minded UI: 10 Hz clock + cached shell strings
-    clock: Hz10Clock,
+    clock: HzClock,
     pub text: StatusText,
 
     // timing
@@ -333,6 +374,58 @@ pub struct AlifeApp {
     pub cam_t: f32,
     /// smooth frame dt for camera damping (UI-measured)
     pub dt_last: f32,
+
+    // ---- phase 2 wiring (coordinator-owned state) ----
+    /// picking diagnostics overlay (hit radius + candidates + selected id)
+    pub picking_diag: bool,
+    // ---- queen exhibit wiring ----
+    /// Candidate artifact directories (data dir, exe dir, repo appdata).
+    queen_dirs: Vec<std::path::PathBuf>,
+    /// Loaded/verified queen connectome (`None` = no artifact found yet).
+    queen_connectome: Option<Arc<Connectome>>,
+    /// Path whose artifact produced `queen_connectome` (for re-attach).
+    queen_factory_path: Option<std::path::PathBuf>,
+    /// Honest last failure of the artifact load (never silent).
+    pub queen_factory_err: Option<String>,
+    /// true once the artifact was permanently rejected — stops retries.
+    queen_factory_dead: bool,
+    /// true when a queen was crowned this session (prevents auto-respawn)
+    pub queen_crowned_once: bool,
+    /// true after the one honest "queen died" toast fired.
+    queen_death_toasted: bool,
+    /// Alive tracker of the previous 10 Hz queen check (death-toast edge).
+    queen_alive_seen: bool,
+    // ---- governor wiring ----
+    /// runtime governor (constructed at startup; the app loop applies hints)
+    pub governor: Option<Governor>,
+    /// OS measurement source (process working set + CPU % of one core).
+    gov_metrics: Mutex<SysMetrics>,
+    /// 1 Hz poll clock.
+    gov_clock: HzClock,
+    /// Latest poll diagnostic (feeds the Governor monitor window).
+    pub governor_diag: Option<GovernorDiagnostic>,
+    /// Last per-frame timing report (sim ms / neural ms).
+    pub governor_timings: SubsystemTimings,
+    /// Coordinator-owned policy choice at the last plan.
+    pub governor_policy: Policy,
+    /// Dynamic per-frame step cap from the governor (Green = MAX_STEPS_PER_FRAME).
+    pub governor_step_cap: u64,
+    /// Quality saved when the governor first degraded visuals (restore on Green).
+    governor_saved_quality: Option<Quality>,
+    /// Applied visual-degrade level (None = full fidelity).
+    governor_degrade_applied: Option<u8>,
+    /// First-degrade toast fired once per session.
+    governor_degrade_toasted: bool,
+    /// First pause-advisory toast fired once per session (Critical only).
+    governor_pause_advised_toast: bool,
+    /// Queen brain nanoseconds consumed last aggregate frame (telemetry).
+    pub governor_queen_compute_ns: u64,
+    /// last measured brain exec_ns (for the per-frame delta).
+    last_brain_exec_ns: Option<u64>,
+    /// Queen Brain & Colony observatory window
+    pub show_brain_window: bool,
+    /// Governor monitor window
+    pub show_governor_window: bool,
 }
 
 impl AlifeApp {
@@ -365,7 +458,7 @@ impl AlifeApp {
             world_name: "genesis-start".to_string(),
             preset_name: "genesis".to_string(),
             world_tag: 1,
-            running: false,
+            running: true,
             timescale: TimeScale::RealTime,
             budgeted: false,
             acc: 0.0,
@@ -415,7 +508,7 @@ impl AlifeApp {
             records_seen: HashMap::new(),
             stats_cache: None,
             hist_cache: None,
-            clock: Hz10Clock::default(),
+            clock: HzClock::new(0.1),
             text: StatusText::default(),
             last_frame: None,
             steps_win_start: Instant::now(),
@@ -428,6 +521,8 @@ impl AlifeApp {
             frame_no: 0,
 
             view3d_ready,
+            // The proven 2D world canvas is the default view; the wgpu 3D
+            // living world stays opt-in on demand (press `3` to toggle).
             view3d_on: false,
             mode3d: alife_view3d::camera::CameraMode::Planet,
             cam3d: alife_view3d::camera::CameraState::new(),
@@ -436,10 +531,358 @@ impl AlifeApp {
             last_follow_pos: None,
             cam_t: 0.0,
             dt_last: 1.0 / 60.0,
+
+            picking_diag: false,
+            queen_dirs: Vec::new(),
+            queen_connectome: None,
+            queen_factory_path: None,
+            queen_factory_err: None,
+            queen_factory_dead: false,
+            queen_crowned_once: false,
+            queen_death_toasted: false,
+            queen_alive_seen: false,
+            governor: Some(Governor::new(GovernorConfig::default())),
+            gov_metrics: Mutex::new(SysMetrics::new()),
+            gov_clock: HzClock::new(1.0),
+            governor_diag: None,
+            governor_timings: SubsystemTimings::default(),
+            governor_policy: Policy::Balanced,
+            governor_step_cap: MAX_STEPS_PER_FRAME,
+            governor_saved_quality: None,
+            governor_degrade_applied: None,
+            governor_degrade_toasted: false,
+            governor_pause_advised_toast: false,
+            governor_queen_compute_ns: 0,
+            last_brain_exec_ns: None,
+            show_brain_window: false,
+            show_governor_window: false,
         };
+        // boots in habitat-orbit over the world center: the creatures are
+        // visible from step one, and the gold-ringed queen is recognizable
+        {
+            let c = (app.sim.world.width * 0.5, app.sim.world.height * 0.5);
+            app.cam3d.request_habitat(c, 0.0);
+            app.mode3d = alife_view3d::camera::CameraMode::Orbit { focus: c };
+        }
+        app.queen_dirs = Self::queen_artifact_dirs(&data_dir);
+        #[cfg(debug_assertions)]
+        {
+            for (i, d) in app.queen_dirs.iter().enumerate() {
+                let artifact = d.join(qb::QUEEN_ARTIFACT_FILE);
+                eprintln!(
+                    "[alife][dbg] queen artifact candidate #{i}: {} -> {} (exists: {})",
+                    d.display(),
+                    artifact.display(),
+                    artifact.is_file()
+                );
+            }
+        }
+        app.attach_queen_factory();
         app.toasts
             .push(ToastKind::Info, "World ready — press Space to run");
         app
+    }
+
+    /// Artifact search directories, in priority order: the app data dir's
+    /// `connectomes/`, the executable dir's `connectomes/`, then the repo's
+    /// debug exhibit dir (`<repo>/appdata/malecns166k` for dev runs) walked
+    /// up from both the cwd and the exe dir (canonical resolution: first
+    /// candidate carrying the artifact wins, stored once).
+    fn queen_artifact_dirs(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut dirs = vec![data_dir.join(QUEEN_CONNECTOMES_DIR)];
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(d) = exe.parent() {
+                dirs.push(d.join(QUEEN_CONNECTOMES_DIR));
+                // dev/debug runs live several levels below the repo root
+                let mut walk = Some(d);
+                for _ in 0..4 {
+                    let Some(p) = walk else { break };
+                    dirs.push(p.join(QUEEN_REPO_ARTIFACT_DIR));
+                    walk = p.parent();
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            dirs.push(cwd.join(QUEEN_REPO_ARTIFACT_DIR));
+            if let Some(repo) = cwd.parent() {
+                dirs.push(repo.join(QUEEN_REPO_ARTIFACT_DIR));
+            }
+        }
+        dirs
+    }
+
+    /// Load + verify the queen connectome artifact (first candidate that
+    /// carries it) and register the rehydration factory on the CURRENT sim.
+    /// Idempotent; a found-and-verified artifact is cached on the app so a
+    /// freshly installed world can re-register without re-reading disk. The
+    /// identical load+probe sequence is core's `register_default_factory`.
+    pub fn attach_queen_factory(&mut self) {
+        // already loaded for this session? just re-register on the live sim
+        if let Some(conn) = self.queen_connectome.clone() {
+            self.reattach_queen_factory();
+            return;
+        }
+        if self.queen_factory_dead {
+            return;
+        }
+        for dir in &self.queen_dirs {
+            let path = dir.join(qb::QUEEN_ARTIFACT_FILE);
+            if !path.is_file() {
+                continue;
+            }
+            match alife_neural::connectome_binary::load(&path) {
+                Ok(conn) => {
+                    match alife_neural::queen_adapter::QueenBrainAdapter::new_from_connectome(
+                        conn.clone(),
+                        0,
+                    ) {
+                        Ok(_) => {
+                            self.queen_connectome = Some(conn.clone());
+                            self.queen_factory_path = Some(path.clone());
+                            self.queen_factory_err = None;
+                            self.reattach_queen_factory();
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[alife][dbg] queen artifact registered from: {}",
+                                path.display()
+                            );
+                            self.toasts.push(
+                                ToastKind::Ok,
+                                format!("Queen brain artifact loaded — {}", path.display()),
+                            );
+                        }
+                        Err(e) => {
+                            self.queen_factory_err =
+                                Some(format!("queen artifact unusable by runtime: {e:?}"));
+                            self.queen_factory_dead = true;
+                            #[cfg(debug_assertions)]
+                            eprintln!("[alife][dbg] queen artifact unusable at {}: {e:?}", path.display());
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.queen_factory_err = Some(format!("queen artifact load failed: {e}"));
+                    self.queen_factory_dead = true;
+                    #[cfg(debug_assertions)]
+                    eprintln!("[alife][dbg] queen artifact load failed at {}: {e}", path.display());
+                }
+            }
+            return; // only the first candidate carrying the file is authoritative
+        }
+    }
+
+    /// Register the (already-loaded) factory on the live simulation — needed
+    /// again after `Simulation::new` replaced the sim.
+    fn reattach_queen_factory(&mut self) {
+        if let Some(conn) = self.queen_connectome.clone() {
+            self.sim
+                .set_queen_brain_factory(Some(Box::new(qb::MaleCnsQueenBrainFactory::from_connectome(conn))));
+            self.queen_factory_path = self
+                .queen_factory_path
+                .take()
+                .or_else(|| {
+                    self.queen_dirs
+                        .iter()
+                        .find(|d| d.join(qb::QUEEN_ARTIFACT_FILE).is_file())
+                        .map(|d| d.join(qb::QUEEN_ARTIFACT_FILE))
+                });
+        }
+    }
+
+    /// 10 Hz queen exhibit tick: (1) keep looking for the artifact until it
+    /// appears or is rejected, (2) auto-crown ONCE per world (first living
+    /// organism; success plugs the 166k brain when available) and toast; a
+    /// dead queen toasts honestly once — she is NEVER auto-respawned.
+    fn queen_tick(&mut self) {
+        // keep looking for the artifact ~10 Hz (not every frame) until it
+        // appears or is permanently rejected
+        if self.queen_connectome.is_none() && self.frame_no % 6 == 0 {
+            self.attach_queen_factory();
+        }
+        let alive_now = self.sim.queen_id().is_some();
+
+        // auto-crown once (population>0, not crowned this session)
+        if !self.queen_crowned_once && !alive_now {
+            let pop = self.sim.stats().population;
+            if pop > 0 {
+                if let Some(id) = self.sim.organisms().iter().find(|o| o.alive).map(|o| o.id) {
+                    if self.sim.crown_queen(id) {
+                        self.queen_crowned_once = true;
+                        self.plug_queen_brain();
+                        // the queen IS the screen's protagonist: camera follows
+                        // her and the inspector opens on her until the user
+                        // deliberately picks someone else
+                        self.selected = Some(id);
+                        self.follow_selected = true;
+                        // honest crown toast: state of the 166k brain matters
+                        let synapses = self
+                            .sim
+                            .queen_brain_stats()
+                            .map(|s| s.synapse_count)
+                            .unwrap_or(0);
+                        if synapses > 0 {
+                            self.toasts.push(
+                                ToastKind::Ok,
+                                format!("Queen crowned — org #{id}; MaleCNS brain plugged ({synapses} synapses)"),
+                            );
+                        } else if self.queen_factory_err.is_some() || self.queen_connectome.is_none() {
+                            self.toasts.push(
+                                ToastKind::Warn,
+                                format!(
+                                    "Queen crowned — org #{id}; brain failed to load (artifact read issue)"
+                                ),
+                            );
+                        } else {
+                            self.toasts
+                                .push(ToastKind::Ok, format!("Queen crowned — org #{id}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        // one honest death toast; no respawn ever
+        if self.queen_crowned_once
+            && self.queen_alive_seen
+            && !alive_now
+            && !self.queen_death_toasted
+        {
+            self.queen_death_toasted = true;
+            self.toasts.push(
+                ToastKind::Warn,
+                "The Queen has died — one reign per world; no auto-respawn",
+            );
+            self.selected = None;
+        }
+        self.queen_alive_seen = alive_now;
+    }
+
+    /// Plug the 166k brain into the currently crowned queen (built from the
+    /// same verified connectome the factory keeps). Without the artifact the
+    /// queen stays on her stock net — an honest, never a fake, state.
+    fn plug_queen_brain(&mut self) {
+        let Some(conn) = self.queen_connectome.clone() else { return };
+        let factory = qb::MaleCnsQueenBrainFactory::from_connectome(conn);
+        self.sim.set_queen_brain(Some(factory.build()));
+    }
+
+    // ------------------------------------------------- governor apply loop
+
+    /// 1 Hz governor application (advisory-only; see alife-governor docs):
+    /// report the last frame's timings, poll the real OS measurement source,
+    /// plan, then apply the [`ApplyHints`] mapping:
+    /// * `step_cap_hint` → `governor_step_cap` (`min(app default, hint)`; the
+    ///   step loop consumes exactly this each frame, Green = app default).
+    /// * `visual_degrade` 0 → restore saved Quality (full fidelity; 1..=3 →
+    ///   the app's lowest detail level, Efficient — our three-level Quality
+    ///   enum has no finer-grained step than that, documented, honest).
+    /// * `pause_advisory` (Critical) → one honest toast; the sim keeps
+    ///   running (the advisory never pauses by itself).
+    fn gov_tick(&mut self) {
+        if !self.gov_clock.due() {
+            return;
+        }
+        if self.governor.is_none() {
+            return;
+        }
+
+        // poll with the real OS source (fresh measurement, no caching layer)
+        let diag = {
+            let src = self.gov_metrics.lock().expect("sys metrics mutex");
+            self.governor
+                .as_mut()
+                .expect("checked above")
+                .poll(&*src)
+        };
+        self.governor_diag = Some(diag);
+
+        {
+            let stats = self.sim.stats();
+            let governor = self.governor.as_mut().expect("checked above");
+            governor.report_timings(&self.governor_timings);
+            let input = PolicyInput {
+                tick: self.frame_no,
+                population: stats.population,
+                policy: self.governor_policy,
+                queen_alive: self.sim.queen_id().is_some(),
+                queen_compute_ns: self.governor_queen_compute_ns as u128,
+                avg_bio_energy: BioEnergy::new(stats.avg_energy),
+                // no coordinator CU accounting yet — honest zero demand
+                demanded_compute: ComputeUnits::ZERO,
+            };
+            let plan = governor.plan(&input);
+            let hints: ApplyHints = plan.to_apply_hints();
+
+            // step cap: a hint can only lower the app default, never raise it
+            let cap = hints
+                .step_cap_hint
+                .unwrap_or(MAX_STEPS_PER_FRAME)
+                .min(MAX_STEPS_PER_FRAME)
+                .max(1);
+            self.governor_step_cap = cap;
+
+            // visual degrade: 0 = full fidelity (restore), 1..=3 = Efficient
+            match hints.visual_degrade {
+                0 => {
+                    if let Some(saved) = self.governor_saved_quality.take() {
+                        self.quality = saved;
+                        self.toasts.push(
+                            ToastKind::Info,
+                            format!("Governor: pressure gone — visuals restored ({})", saved.label()),
+                        );
+                    }
+                    self.governor_degrade_applied = None;
+                }
+                level if level != self.governor_degrade_applied.unwrap_or(u8::MAX) => {
+                    if self.governor_saved_quality.is_none() {
+                        self.governor_saved_quality = Some(self.quality);
+                    }
+                    // 1 → 3 all map below Balanced; 3 is the app's lowest tier
+                    self.quality = Quality::Efficient;
+                    self.governor_degrade_applied = Some(level);
+                    if !self.governor_degrade_toasted {
+                        self.governor_degrade_toasted = true;
+                        self.toasts.push(
+                            ToastKind::Warn,
+                            format!(
+                                "Governor: visual detail lowered ({}) — restoring automatically when pressure clears",
+                                governor_degrade_label(level)
+                            ),
+                        );
+                    }
+                }
+                _ => {}
+            }
+
+            // pause advisory (Critical only): advisory, never a forced pause
+            if hints.pause_advisory && !self.governor_pause_advised_toast {
+                self.governor_pause_advised_toast = true;
+                self.toasts.push(
+                    ToastKind::Warn,
+                    "Governor: memory critical — consider a break (advisory; the sim keeps running)",
+                );
+            } else if !hints.pause_advisory {
+                self.governor_pause_advised_toast = false;
+            }
+        }
+    }
+
+    /// Per-frame timings fed to the governor's `report_timings` (1 Hz).
+    /// `render_ms` is a cheap, documented proxy: the full egui frame wall
+    /// time (it contains idle-sleep when paused — the governor only uses
+    /// ratios, and 60 Hz running frames are what it is for).
+    fn record_frame_timings(&mut self, frame_dt: f32, sim_ms: f32, steps: u64) {
+        self.governor_timings.render_ms = (frame_dt * 1000.0).clamp(0.0, 1000.0);
+        self.governor_timings.sim_ms = sim_ms.clamp(0.0, 1000.0);
+        // brain cost: measured exec_ns of the plugged (or stock) brain at the
+        // last advance, scaled by the sim steps this frame (budget: 1 tick
+        // per advance). Zero without a stats surface — never invented.
+        let exec_ns = self.sim.queen_brain_stats().map(|s| s.exec_ns).unwrap_or(0);
+        self.governor_queen_compute_ns = exec_ns;
+        self.last_brain_exec_ns = Some(exec_ns);
+        self.governor_timings.neural_ms = (exec_ns as f32 * steps as f32 / 1.0e6).min(1000.0);
+        // no separate ecology measurement in this shell — honest zero
+        self.governor_timings.ecology_ms = 0.0;
     }
 
     // ------------------------------------------------------------ world mgmt
@@ -479,6 +922,16 @@ impl AlifeApp {
         self.gen_seed = cfg.seed;
         self.gen_width = cfg.width;
         self.gen_height = cfg.height;
+        // a new world means a fresh reign: crown-once flag resets
+        self.queen_crowned_once = false;
+        self.queen_death_toasted = false;
+        self.queen_alive_seen = false;
+        self.show_brain_window = false;
+        // governor state resets with the world (Green baseline until the next
+        // 1 Hz poll re-rates it)
+        self.governor_step_cap = MAX_STEPS_PER_FRAME;
+        self.budgeted = false;
+        self.reattach_queen_factory();
         self.reset_view_for_world();
     }
     /// Restart the current world: same terrain + params, fresh population.
@@ -505,6 +958,13 @@ impl AlifeApp {
         self.god_purge_arm = 0;
         self.running = false;
         self.acc = 0.0;
+        // a restart means a fresh reign: crown-once flag resets
+        self.queen_crowned_once = false;
+        self.queen_death_toasted = false;
+        self.queen_alive_seen = false;
+        self.governor_step_cap = MAX_STEPS_PER_FRAME;
+        self.budgeted = false;
+        self.reattach_queen_factory();
         self.view.trails.clear();
         self.toasts.push(ToastKind::Ok, "World reset");
     }
@@ -512,8 +972,9 @@ impl AlifeApp {
     /// Install a simulation restored from a loaded `WorldSave`.
     pub fn apply_loaded(&mut self, ws: &WorldSave) {
         match save_io::restore_from_save(ws) {
-            Ok(sim) => {
-                self.sim = sim;
+            Ok(restored) => {
+                let queen_was_crowned = restored.queen_was_crowned();
+                self.sim = restored.sim;
                 self.history = ws.history.clone();
                 self.world_cfg = ws.world_config;
                 self.preset_name = ws.preset.clone().unwrap_or_default();
@@ -528,9 +989,9 @@ impl AlifeApp {
                 self.tree_cache = None;
                 self.god_cache = None;
                 self.hud_weather = None;
-        self.weather_layer = None;
-        self.hover_pick = None;
-        self.hover_chip = (0, String::new());
+                self.weather_layer = None;
+                self.hover_pick = None;
+                self.hover_chip = (0, String::new());
                 self.death_causes = [0; 3];
                 self.death_seen = false;
                 self.god_purge_arm = 0;
@@ -539,6 +1000,17 @@ impl AlifeApp {
                 self.gen_seed = ws.world_config.seed;
                 self.gen_width = ws.world_config.width;
                 self.gen_height = ws.world_config.height;
+                // Queen reign state (save v2 `core.queen` payload): a saved
+                // world whose queen already lived — alive or dead — has had
+                // its reign; the crown-once flag prevents any respawn, and a
+                // dead selection is cleared.
+                self.queen_crowned_once = queen_was_crowned;
+                self.queen_death_toasted =
+                    queen_was_crowned && !self.sim.queen_id().is_some();
+                self.queen_alive_seen = self.sim.queen_id().is_some();
+                self.governor_step_cap = MAX_STEPS_PER_FRAME;
+                self.budgeted = false;
+                self.reattach_queen_factory();
                 self.reset_view_for_world();
                 self.view.trails.clear();
                 self.view_sel = AppView::World;
@@ -578,17 +1050,23 @@ impl AlifeApp {
     }
 
     /// Fixed-step simulation with accumulator and a hard per-frame budget.
-    /// When the requested time scale needs more than `MAX_STEPS_PER_FRAME`
-    /// steps in one frame the engine throttles and `budgeted` is raised so
-    /// the HUD can honestly report achieved < requested.
+    /// When the requested time scale needs more steps in one frame than the
+    /// governor's dynamic step cap allows (Green cap = `MAX_STEPS_PER_FRAME`,
+    /// Warn/Critical = STEP_CAP_WARN/CRITICAL via `governor_step_cap`) the
+    /// engine throttles and `budgeted` is raised so the HUD can honestly
+    /// report achieved < requested.
     fn simulate(&mut self, dt: f32) {
         let was_running = self.running;
         self.budgeted = false;
+        let mut sim_ms = 0.0f32;
+        let mut sim_steps = 0u64;
         if self.running {
+            let step_clock = Instant::now();
             self.acc += dt * self.timescale.mult();
+            let cap = self.governor_step_cap.max(1);
             let mut steps = 0u64;
             while self.acc >= DT {
-                if steps >= MAX_STEPS_PER_FRAME {
+                if steps >= cap {
                     self.budgeted = true;
                     self.acc = 0.0; // drop backlog: the budget is the honest cap
                     break;
@@ -600,6 +1078,8 @@ impl AlifeApp {
                 steps += 1;
             }
             self.steps_win_steps += steps;
+            sim_steps = steps;
+            sim_ms = step_clock.elapsed().as_secs_f32() * 1000.0;
 
             let pop = self.sim.stats().population;
             if pop > 0 {
@@ -618,6 +1098,7 @@ impl AlifeApp {
                 save_io::collect_records(&mut self.records_seen, &self.sim);
             }
         }
+        self.record_frame_timings(dt, sim_ms, sim_steps);
         let elapsed = self.steps_win_start.elapsed();
         if elapsed >= Duration::from_millis(500) {
             let secs = elapsed.as_secs_f64();
@@ -796,7 +1277,14 @@ impl AlifeApp {
                 self.view.zoom_at_screen(center, 0.8);
             }
             if i.key_pressed(egui::Key::G) {
-                self.view.show_grid = !self.view.show_grid;
+                if i.modifiers.shift {
+                    self.view.show_grid = !self.view.show_grid;
+                } else {
+                    self.show_governor_window = !self.show_governor_window;
+                }
+            }
+            if i.key_pressed(egui::Key::B) {
+                self.show_brain_window = !self.show_brain_window;
             }
             if i.key_pressed(egui::Key::I) {
                 self.show_inspector = !self.show_inspector;
@@ -898,6 +1386,8 @@ impl eframe::App for AlifeApp {
         self.simulate(dt);
         self.hint_tick(dt);
         self.tick_slow_clock();
+        self.queen_tick();
+        self.gov_tick();
         self.shell(ctx);
 
         match self.view_sel {
@@ -909,6 +1399,21 @@ impl eframe::App for AlifeApp {
             AppView::GodMode => crate::panels_god::god_view(self, ctx),
             AppView::WorldEditor => panels_editor::editor_view(self, ctx),
             AppView::Settings => panels_screens::settings_view(self, ctx),
+        }
+
+        // observatory windows (B / G toggles): built from the panels' own
+        // data-extraction signatures; show_* take a plain borrow of self
+        if self.show_brain_window {
+            let q = panels_brain::queen_ui_data(&self.sim);
+            let c = panels_brain::colony_ui_data(&self.sim);
+            panels_brain::show_brain(self, ctx, &q, &c);
+        }
+        if self.show_governor_window {
+            let g = panels_governor::governor_ui_data_from(
+                self.governor.as_ref(),
+                Some(&self.governor_timings),
+            );
+            panels_governor::show_governor(self, ctx, &g);
         }
 
         self.inspector_panel(ctx);
@@ -984,13 +1489,19 @@ impl AlifeApp {
                         ui.label(crate::widgets::mono(&self.text.achieved, theme::WEAK))
                             .on_hover_text("Measured sim seconds per wall second (ring-smoothed)");
                         if self.budgeted {
+                            let cap = self.governor_step_cap.max(1);
                             let b = ui.label(crate::widgets::mono("budgeted", theme::WARN));
                             b.on_hover_text(format!(
                                 "Requested {}x exceeds the per-frame step budget \
-                                 ({} steps/frame): achieved sim time per real second is \
+                                 ({} steps/frame{}): achieved sim time per real second is \
                                  lower than requested — the engine throttles honestly",
                                 self.timescale.mult(),
-                                MAX_STEPS_PER_FRAME
+                                cap,
+                                if cap == MAX_STEPS_PER_FRAME {
+                                    String::new()
+                                } else {
+                                    format!(", governor-limited")
+                                }
                             ));
                         }
                     }
@@ -1007,6 +1518,24 @@ impl AlifeApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if crate::widgets::icon_btn(ui, "?", "Shortcut list (?)").clicked() {
                             self.show_shortcuts = !self.show_shortcuts;
+                        }
+                        if crate::widgets::mini_btn(
+                            ui,
+                            "Gov",
+                            "God Commander governor monitor (G)",
+                        )
+                        .clicked()
+                        {
+                            self.show_governor_window = !self.show_governor_window;
+                        }
+                        if crate::widgets::mini_btn(
+                            ui,
+                            "Brain",
+                            "Queen Brain & Colony observatory (B)",
+                        )
+                        .clicked()
+                        {
+                            self.show_brain_window = !self.show_brain_window;
                         }
                         if crate::widgets::mini_btn(ui, "Load", "Load a saved world").clicked() {
                             self.dialog = Some(Dialog::Load { confirm_delete: None });
@@ -1072,7 +1601,7 @@ impl AlifeApp {
                     .on_hover_text("Measured sim time per wall second; a budgeted badge means the per-frame step cap throttled the engine");
                     if self.running && self.budgeted {
                         ui.label(crate::widgets::mono(
-                            format!("budgeted (< {} steps/frame cap)", MAX_STEPS_PER_FRAME),
+                            format!("budgeted (< {} steps/frame cap)", self.governor_step_cap.max(1)),
                             theme::WARN,
                         ));
                     }
