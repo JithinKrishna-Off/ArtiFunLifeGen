@@ -9,6 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Biology -> render morphology bridge (AGENT: morphology).
+pub mod morphology;
+
 // ------------------------------------------------------------- neural net
 pub const NET_INPUTS: usize = 11;
 pub const NET_HIDDEN: usize = 10;

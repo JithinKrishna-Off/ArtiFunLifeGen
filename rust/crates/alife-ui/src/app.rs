@@ -359,6 +359,10 @@ pub struct AlifeApp {
     // ---- 3D living world (panels_3d) ----
     /// wgpu backend present && View3D successfully installed
     pub view3d_ready: bool,
+    /// wgpu renderer handle: the §7 HUD diag block reads VIEW3D's cheap
+    /// accessors through the callback resources on this renderer. None = 2D.
+    pub view3d_renderer:
+        Option<Arc<egui::epaint::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
     /// the 3D canvas replaces the 2D canvas while enabled
     pub view3d_on: bool,
     /// current multi-scale camera request (Follow / Orbit / Planet)
@@ -521,6 +525,7 @@ impl AlifeApp {
             frame_no: 0,
 
             view3d_ready,
+            view3d_renderer: cc.wgpu_render_state.as_ref().map(|rs| rs.renderer.clone()),
             // The proven 2D world canvas is the default view; the wgpu 3D
             // living world stays opt-in on demand (press `3` to toggle).
             view3d_on: false,
@@ -714,6 +719,23 @@ impl AlifeApp {
                         // deliberately picks someone else
                         self.selected = Some(id);
                         self.follow_selected = true;
+                        // stage the queen-focus follow cam right here: the
+                        // initial 3D camera frames her at the 2.6-body-length
+                        // anatomy distance (no-op until 3D is entered/active)
+                        if let Some(queen) = self.sim.organism(id) {
+                            let at = (queen.x, queen.y);
+                            let th = alife_view3d::terrain::terrain_height_at(
+                                &self.sim.world,
+                                at.0,
+                                at.1,
+                            );
+                            self.cam3d.request_queen_focus(id, at, th);
+                            // engage the follow cam when the 3D layer is what
+                            // is on screen; staged states survive for 2D users
+                            if self.view3d_on {
+                                self.mode3d = alife_view3d::camera::CameraMode::Follow { id };
+                            }
+                        }
                         // honest crown toast: state of the 166k brain matters
                         let synapses = self
                             .sim
@@ -1212,6 +1234,32 @@ impl AlifeApp {
         // Escape works even while a text field has focus: editor tool -> dialog -> selection.
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if esc {
+            // One-key camera exit while riding the queen POV or following
+            // her: land on the wide world orbit (the WORLD VIEW button's
+            // landing). Every other 3D level keeps the pop-one-level Esc.
+            let queen_id_now = self.sim.queen_id().map(|q| q as u64);
+            let queen_follow = matches!(
+                self.mode3d,
+                alife_view3d::camera::CameraMode::Follow { id } if Some(id) == queen_id_now
+            );
+            if self.view3d_on && (self.cam3d.pov_active() || queen_follow) {
+                let center = (self.sim.world.width * 0.5, self.sim.world.height * 0.5);
+                let at = match self.cam3d.pov_at() {
+                    Some(p) => Some(p),
+                    // queen follow: anchor on her live position
+                    None => queen_id_now
+                        .and_then(|q| self.sim.organism(q))
+                        .map(|o| (o.x, o.y)),
+                }
+                .unwrap_or(center);
+                let th =
+                    alife_view3d::terrain::terrain_height_at(&self.sim.world, at.0, at.1);
+                self.cam3d.return_to_world_orbit(Some(at), th);
+                self.mode3d = alife_view3d::camera::CameraMode::Orbit { focus: at };
+                self.toasts
+                    .push(ToastKind::Info, "Esc: camera back on world orbit");
+                return;
+            }
             if self.view3d_on && !crate::panels_3d::pop_level(self) {
                 return;
             }

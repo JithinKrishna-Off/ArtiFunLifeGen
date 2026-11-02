@@ -99,13 +99,20 @@ pub fn rings_for(mode: u8, window: f32) -> (f32, f32) {
     }
 }
 
-/// Per-clump vegetation record (48 bytes, all-f32, bytemuck Pod).
+/// Per-clump vegetation record (52 bytes / 13 x f32, bytemuck Pod). The
+/// attribute contract is: @location(1) = the (x, z) vec2 at byte 0, then
+/// one f32 per following field at its natural field byte offset (8, 12,
+/// ... 48). `grass.rs::inst_attrs` mirrors this exactly (grass_lint.rs
+/// pins both).
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub struct GrassInst {
-    /// CLUMP ANCHOR in world coords
+    /// CLUMP ANCHOR in world coords; `y` is the ground contact height
+    /// (terrain elevation * HEIGHT_SCALE, sunk 0.08 into the surface so
+    /// root rows never z-fight with the terrain mesh)
     pub x: f32,
     pub z: f32,
+    pub gy: f32,
     /// nominal blade base height in world units (species/fertility driven)
     pub height: f32,
     /// blade width in world units
@@ -584,6 +591,7 @@ pub fn build(world: &impl WorldSampling, b: &Builder) -> BuildResult {
                 insts.push(GrassInst {
                     x: ax,
                     z: az,
+                    gy: e * HEIGHT_SCALE - 0.08,
                     height: lerp(rule.h0, rule.h1, rh),
                     width: lerp(rule.w0, rule.w1, rw),
                     tint_hue: lerp(rule.hue0, rule.hue1, rc),

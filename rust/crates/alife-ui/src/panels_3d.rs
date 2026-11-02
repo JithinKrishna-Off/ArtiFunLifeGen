@@ -422,19 +422,18 @@ pub fn canvas3d(app: &mut AlifeApp, ui: &mut egui::Ui, rect: Rect) {
     paint_hover_ui(app, ui, pointer_pos);
 
     paint_hud(app, ui, rect);
+    paint_view_diag(app, ui, rect);
     paint_cam_buttons(app, ui, rect);
 }
 
-/// Corner HUD: camera mode, ground coords under the crosshair and the active
-/// key hints. Bounded to <= 220 x 140 px, pass-through (no interaction). The
-/// queen POV / focus sub-modes relabel the mode row and report her coords.
-fn paint_hud(app: &AlifeApp, ui: &egui::Ui, rect: Rect) {
-    let pad = 8.0;
-    let hud_w = 220.0_f32.min(rect.width() - 2.0 * pad).max(0.0);
-    let free = app.cam3d.free_cam();
+/// Camera mode label shared by the corner HUD and the §7 diag block:
+/// ("QUEEN FOCUS #id" / "FOLLOW #id" / "HABITAT [FREE FLY]" / "QUEEN POV" /
+/// "PLANET", color accent).
+fn cam_label(app: &AlifeApp) -> (String, egui::Color32) {
     let pov = app.cam3d.pov_active();
+    let free = app.cam3d.free_cam();
     let queen_id = app.sim.queen_id().map(|q| q as u64);
-    let (mode_name, accent) = match app.mode3d {
+    match app.mode3d {
         CamMode::Follow { id } => {
             if Some(id) == queen_id {
                 (format!("QUEEN FOCUS  #{id}"), theme::OK)
@@ -452,24 +451,35 @@ fn paint_hud(app: &AlifeApp, ui: &egui::Ui, rect: Rect) {
             }
         }
         CamMode::Planet => ("PLANET".to_string(), theme::ACCENT),
-    };
-    // while riding her POV the coords row reports the queen anchor itself
+    }
+}
+
+/// Corner HUD: camera mode, ground coords under the crosshair and the active
+/// key hints. Bounded to <= 220 x 140 px, pass-through (no interaction). The
+/// queen POV / focus sub-modes relabel the mode row and report her coords.
+fn paint_hud(app: &AlifeApp, ui: &egui::Ui, rect: Rect) {
+    let pad = 8.0;
+    let hud_w = 220.0_f32.min(rect.width() - 2.0 * pad).max(0.0);
+    let free = app.cam3d.free_cam();
+    let pov = app.cam3d.pov_active();
+    let (mode_name, accent) = cam_label(app);    // while riding her POV the coords row reports the queen anchor itself
     let (gx, gy) = match (pov, app.cam3d.pov_at()) {
         (true, Some((x, y))) => (x, y),
         _ => app.cam3d.look_ground(),
     };
     let coords = format!("at ({:.0}, {:.0})", gx, gy);
+    let queen_id = app.sim.queen_id().map(|q| q as u64);
     let hints: [&str; 4] = match app.mode3d {
         CamMode::Planet => ["Drag / Wheel orbit", "Enter: descend to select", "Esc: back to 2D", "F9: pick diag"],
         CamMode::Orbit { .. } => if pov {
-            ["POV gaze from the queen head", "Drag is ignored · click selects", "Exit: WORLD VIEW button", "F9: pick diag"]
+            ["POV gaze from the queen head", "Drag is ignored · click selects", "Esc: exit to world orbit", "F9: pick diag"]
         } else if free {
             ["WASD move · Q/E alt", "Drag look · C exit fly", "Click select · Esc back", "F9: pick diag"]
         } else {
             ["Drag / Wheel orbit", "WASD pan · C free fly", "Click select · Esc back", "F9: pick diag"]
         },
         CamMode::Follow { id } => if Some(id) == queen_id {
-            ["Drag / Wheel zoom", "WORLD VIEW: back to orbit", "Esc: pop one level", "F9: pick diag"]
+            ["Drag / Wheel zoom", "Esc: back to world orbit", "Enter: refocus her", "F9: pick diag"]
         } else {
             ["Drag / Wheel zoom", "Enter: back to habitat", "Esc: pop one level", "F9: pick diag"]
         },
@@ -538,6 +548,124 @@ fn queen_status(app: &AlifeApp) -> Option<(String, egui::Color32, Option<&'stati
             .queen_events()
             .last()
             .map(|ev| (format!("QUEEN #{} dead", ev.org_id), theme::DANGER, None))
+    }
+}
+
+// ---------------------------------------------------------------- §7 diag
+
+/// §7 diagnostics mini-panel (top-right, always visible while the 3D layer
+/// is on): three mono rows, pass-through painter only.
+///
+/// * `GRASS clumps n chunks c LOD a/b/c trample r` — live renderer state:
+///   `Grass::diag_counts` (resident clump cache + drawn chunks) and
+///   `Grass::diag_lod` (near/mid/far chunk histogram of the last draw); the
+///   trample radius is the morph planner's real queen footprint radius.
+/// * `QUEEN len | r | trample | pos | speed | brain` — length and radius are
+///   the documented queen constants (`QUEEN_BODY_LEN`, `2*QUEEN_UNIT_RADIUS`);
+///   position rides the planned trample center when available (render-side
+///   truth) and falls back to the sim organism; speed is her live `o.speed`
+///   (u/s, cheap single-arena lookup); brain is OK iff the plugged brain
+///   reports synapses and no factory failure, "err" otherwise, "-" crownless.
+/// * `CAM ... | QUEEN ...` — camera label + queen alive/id. Everything is
+///   real (no approximated values) because the diag accessors sit on the
+///   persistent View3D in egui's callback resources, read UI-side through
+///   the stored `RenderState`; all of them are Relaxed-atomic / short-mutex
+///   and lock-free for the render thread's lane.
+fn paint_view_diag(app: &AlifeApp, ui: &egui::Ui, rect: Rect) {
+    if !app.view3d_on {
+        return;
+    }
+    let Some(renderer_lock) = app.view3d_renderer.as_ref() else { return };
+    let renderer = renderer_lock.read();
+    let Some(view) = renderer.callback_resources.get::<alife_view3d::View3D>() else {
+        return;
+    };
+    let (clumps, chunks) = view.grass.diag_counts();
+    let (lod_n, lod_m, lod_f) = view.grass.diag_lod();
+    let fp = view.morph.queen_footprint();
+    let (tr_r, tr_at) = fp
+        .map(|(x, z, r, _)| (Some(r), Some((x, z))))
+        .unwrap_or((None, None));
+
+    let queen = app
+        .sim
+        .queen_id()
+        .and_then(|q| app.sim.organism(q as u64))
+        .map(|o| ((o.x, o.y), o.speed));
+    let q_pos = tr_at.or(queen.map(|(p, _)| p));
+    let q_speed = queen.map(|(_, s)| s).filter(|v| v.is_finite());
+    let brain = match app.sim.queen_id() {
+        Some(_) => match app.sim.queen_brain_stats() {
+            Some(s) if s.synapse_count > 0 && app.queen_factory_err.is_none() => "OK",
+            _ => "err",
+        },
+        None => "-",
+    };
+
+    let grass_line = format!(
+        "GRASS clumps {clumps} chunks {chunks} LOD {lod_n}/{lod_m}/{lod_f} trample {}",
+        tr_r.map(|r| format!("r{r:.1}")).unwrap_or_else(|| "r-".into()),
+    );
+    let queen_line = format!(
+        "QUEEN len {:.1}u | r {:.1}u | trample r{} | pos ({}) | {} | brain {}",
+        alife_view3d::camera::QUEEN_BODY_LEN,
+        2.0 * alife_view3d::morph::decomp::QUEEN_UNIT_RADIUS,
+        tr_r.map(|r| format!("{r:.1}")).unwrap_or_else(|| "-".into()),
+        q_pos
+            .map(|(x, z)| format!("{x:.0},{z:.0}"))
+            .unwrap_or_else(|| "-,-".into()),
+        q_speed
+            .map(|s| format!("speed {s:.1}u/s"))
+            .unwrap_or_else(|| "speed -".into()),
+        brain,
+    );
+    let q_state = match app.sim.queen_id() {
+        Some(q) => format!("QUEEN #{q} alive"),
+        None => app
+            .sim
+            .queen_events()
+            .last()
+            .map(|ev| format!("QUEEN #{} dead", ev.org_id))
+            .unwrap_or_else(|| "QUEEN none".into()),
+    };
+    let (cam_txt, cam_col) = cam_label(app);
+    let cam_line = format!("CAM {cam_txt} | {q_state}");
+
+    let pad = 8.0;
+    let line_h = 15.0;
+    let rows: [(&str, egui::Color32); 3] = [
+        (grass_line.as_str(), theme::WEAK),
+        (queen_line.as_str(), theme::WEAK),
+        (cam_line.as_str(), cam_col),
+    ];
+    // measure once per frame (3 cheap galleys) so the backdrop fits exactly
+    let mono = FontId::monospace(10.0);
+    let p = ui.painter();
+    let widest = rows
+        .iter()
+        .map(|(t, _)| p.layout_no_wrap((*t).into(), mono.clone(), theme::WEAK).rect.width())
+        .fold(0.0_f32, f32::max)
+        + 10.0;
+    let top_right = Pos2::new(rect.max.x - pad, rect.min.y + pad);
+    let bg = Rect::from_min_size(
+        Pos2::new(top_right.x - widest, top_right.y),
+        egui::vec2(widest, 3.0 * line_h + 6.0),
+    );
+    p.rect_filled(bg, 4.0, theme::BG_PANEL2.gamma_multiply(0.82));
+    p.rect(
+        bg,
+        4.0,
+        theme::STROKE,
+        egui::Stroke::new(0.75_f32, theme::STROKE),
+    );
+    for (n, (txt, col)) in rows.iter().enumerate() {
+        p.text(
+            Pos2::new(top_right.x, top_right.y + 3.0 + n as f32 * line_h),
+            Align2::RIGHT_TOP,
+            *txt,
+            mono.clone(),
+            *col,
+        );
     }
 }
 

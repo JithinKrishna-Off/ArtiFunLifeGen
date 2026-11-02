@@ -116,6 +116,7 @@ pub fn block_rect(world: &WorldModel, agg: u32, bx: i32, by: i32) -> (f32, f32, 
 /// the wrapping `VirtualWorld`). Blocks inside the bounds must keep using
 /// `block_rect`.
 pub fn block_rect_virtual(world: &WorldModel, agg: u32, bx: i32, by: i32) -> (f32, f32, f32, f32) {
+    let _ = world;
     let block = CHUNK * agg as f32;
     let x0 = bx as f32 * block;
     let y0 = by as f32 * block;

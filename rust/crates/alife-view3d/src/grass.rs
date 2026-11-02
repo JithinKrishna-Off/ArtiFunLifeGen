@@ -9,6 +9,10 @@
 //! Tri budget: <= 9k clumps on screen x 56 tris/clump = <= 504k triangles
 //! (draw loop clamps every 32x32 chunk to <= 150 clumps).
 //!
+//! Instance contract (see place::GrassInst): 52 B = 13 x f32; @location(1)
+//! binds (x, z), locations 2..12 bind gy..pad at their field byte offsets
+//! (`inst_attrs` + grass_lint.rs pin this). Debug toggles: ALIFE_GRASS_DEBUG=1.
+//!
 //! Resource rules (see report):
 //! - `Grass::new(&device)` only prepares CPU state (never fails; the target
 //!   color/depth format is not known at that call site).
@@ -28,6 +32,9 @@ pub mod frustum;
 #[path = "grass_tests.rs"]
 #[cfg(test)]
 mod tests;
+#[path = "grass_lint.rs"]
+#[cfg(test)]
+mod lint;
 
 use crate::grass_clump::{blades_per_clump, clump_vert_count, clump_verts as clump_lattice};
 use crate::scene::{CameraMode, Frame3D};
@@ -58,6 +65,14 @@ const CALM_UNIFORM: GrassUniform = GrassUniform {
     _spare2: [0.0; 4],
 };
 
+/// ALIFE_GRASS_DEBUG=1 (read once, lazily): paints every frame's uniform
+/// so the VS picks per-blade flat hues and the FS lays a red wash over
+/// them — one screenshot shows exactly which blades/verts misbehave.
+fn grass_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ALIFE_GRASS_DEBUG").map(|v| v == "1").unwrap_or(false))
+}
+
 struct CacheKey {
     gen: u32,
     cell: (i32, i32),
@@ -69,7 +84,7 @@ struct CacheChunk {
     cx: i32,
     cy: i32,
     count: u32,
-    /// source byte offset range [off, off + count * 48) in the instance buffer
+    /// source byte offset range [off, off + count * 52) in the instance buffer
     byte_off: u64,
 }
 
@@ -109,6 +124,10 @@ pub struct Grass {
     /// grass-local visual clock (f32 bits: frame paths are &self): wind
     /// keeps waving while the sim is paused; advanced by real frame dt
     vt: AtomicU32,
+    /// cheap layer gate: when off, update_gpu/draw_with no-op. The lead's
+    /// render.rs layer enum (ALIFE_VIEW3D_LAYERS=terrain|grass|queen|all)
+    /// wires this; grass self-gates either way.
+    layer_on: bool,
 }
 
 fn load_f32(a: &AtomicU32) -> f32 {
@@ -136,6 +155,15 @@ impl Grass {
         )
     }
 
+    /// Layer gate API (lead wires the render.rs layer enum here).
+    pub fn set_layer_enabled(&mut self, on: bool) {
+        self.layer_on = on;
+    }
+
+    pub fn layer_enabled(&self) -> bool {
+        self.layer_on
+    }
+
     /// CPU-side state only (contract signature unchanged). The render
     /// pipeline is built by [`ensure_pipeline`] once the coordinator passes
     /// the target formats; until then `draw_with` draws nothing.
@@ -149,6 +177,7 @@ impl Grass {
             lod_mid: AtomicU32::new(0),
             lod_far: AtomicU32::new(0),
             vt: AtomicU32::new(0),
+            layer_on: true,
         })
     }
 
@@ -179,7 +208,7 @@ impl Grass {
             label: Some("view3d.grass.bgl.gust"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -216,7 +245,7 @@ impl Grass {
         });
         let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("view3d.grass.insts"),
-            // hard instance budget: <= 9k clumps, 48B each => <= 504k tris
+            // hard instance budget: <= 9k clumps, 52B each => <= 504k tris
             size: (MAX_BLADES * std::mem::size_of::<GrassInst>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -249,17 +278,8 @@ impl Grass {
             }],
         });
         let inst_stride = std::mem::size_of::<GrassInst>() as u64;
-        let inst_attrs: Vec<wgpu::VertexAttribute> = (0u32..11)
-            .map(|i| wgpu::VertexAttribute {
-                offset: i as u64 * 4,
-                shader_location: 1 + i,
-                format: if i == 0 {
-                    wgpu::VertexFormat::Float32x2
-                } else {
-                    wgpu::VertexFormat::Float32
-                },
-            })
-            .collect();
+        let inst_attrs_attrs = inst_attrs();
+        let inst_attrs: &[wgpu::VertexAttribute] = &inst_attrs_attrs;
         let pipeline = device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("view3d.grass.pline"),
@@ -280,7 +300,7 @@ impl Grass {
                         wgpu::VertexBufferLayout {
                             array_stride: inst_stride,
                             step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: &inst_attrs,
+                            attributes: inst_attrs,
                         },
                     ],
                     compilation_options: Default::default(),
@@ -340,6 +360,9 @@ impl Grass {
         frame: &Frame3D,
         queen_trample: Option<[f32; 4]>,
     ) {
+        if !self.layer_on {
+            return;
+        }
         let Some(gpu) = self.gpu.as_ref() else { return };
         // grass-local visual clock: real frame dt so wind keeps waving while
         // the biological simulation is paused
@@ -425,14 +448,21 @@ impl Grass {
                     // is paused (shader falls back to the shared clock when
                     // this is <= 0)
                     _spare1: [vt, 0.0, 0.0, 0.0],
-                    _spare2: [0.0; 4],
+                    // ALIFE_GRASS_DEBUG=1 -> spare2.y flags the VS per-blade
+                    // hue + FS red wash in every frame's uniform
+                    _spare2: [
+                        0.0,
+                        if grass_debug() { 1.0 } else { 0.0 },
+                        0.0,
+                        0.0,
+                    ],
                 }
             }
             None => GrassUniform {
                 wind_gust: [WIND_DIR[0], WIND_DIR[1], g, 0.0],
                 trample: [0.0, 0.0, -1.0, 0.0],
                 _spare1: [vt, 0.0, 0.0, 0.0],
-                _spare2: [0.0; 4],
+                _spare2: [0.0, if grass_debug() { 1.0 } else { 0.0 }, 0.0, 0.0],
             },
         };
         queue.write_buffer(&gpu.gust_buf, 0, bytemuck::bytes_of(&uniform));
@@ -449,6 +479,9 @@ impl Grass {
         pass: &mut wgpu::RenderPass<'a>,
         frame: Option<&crate::scene::Frame3D>,
     ) {
+        if !self.layer_on {
+            return;
+        }
         let Some(gpu) = self.gpu.as_ref() else { return };
         let Some(frame) = frame else { return };
         // fresh LOD histogram per recording pass
@@ -508,6 +541,33 @@ impl Grass {
             pass.draw(0..span, 0..count);
         }
     }
+}
+
+/// Instance attribute table, pure + offline-testable (grass_lint pins it
+/// against `GrassInst` field byte offsets via `offset_of!`).
+///
+/// ROOT-CAUSE FIX (giant pillars): the old generator emitted scalar
+/// attribute `i` at byte offset `i * 4`, but attribute 0 is the 8-byte
+/// (x, z) vec2. Every following scalar therefore bound ONE FIELD EARLY
+/// (VS `height` read `GrassInst.z`, `width` read `height`, ... `pad` read
+/// `sway`) — height+width read world-scale values => km-scale rectangular
+/// pillars. Scalar f32 field k (k = 2..=12) must bind at byte offset k*4
+/// and shader location k: location 1 = vec2 (fields 0-1), locations 2..12
+/// = gy, height, width, hue, lean, biome, dim, seed, wet, sway, pad.
+pub fn inst_attrs() -> Vec<wgpu::VertexAttribute> {
+    let mut attrs = vec![wgpu::VertexAttribute {
+        shader_location: 1,
+        format: wgpu::VertexFormat::Float32x2,
+        offset: 0,
+    }];
+    for k in 2..=12u64 {
+        attrs.push(wgpu::VertexAttribute {
+            shader_location: k as u32,
+            format: wgpu::VertexFormat::Float32,
+            offset: k * 4,
+        });
+    }
+    attrs
 }
 
 /// single-blade fallback lattice vert count (one blade = 4 stacked quads /
@@ -573,16 +633,17 @@ struct VIn {
     @builtin(vertex_index) vid: u32,
     @location(0) blade: vec2<f32>,  // lateral (pre-tapered), v in [0,1]
     @location(1) xz: vec2<f32>,
-    @location(2) height: f32,
-    @location(3) width: f32,
-    @location(4) hue: f32,
-    @location(5) lean: f32,
-    @location(6) biome: f32,
-    @location(7) dim: f32,
-    @location(8) seed: f32,
-    @location(9) wet: f32,
-    @location(10) sway: f32,
-    @location(11) pad: f32,
+    @location(2) uy: f32,           // ground contact y at the anchor
+    @location(3) height: f32,
+    @location(4) width: f32,
+    @location(5) hue: f32,
+    @location(6) lean: f32,
+    @location(7) biome: f32,
+    @location(8) dim: f32,
+    @location(9) seed: f32,
+    @location(10) wet: f32,
+    @location(11) sway: f32,
+    @location(12) pad: f32,
 }
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -649,7 +710,10 @@ fn vs(in: VIn) -> VOut {
     // of blade_yaw + clump_yaw), so the rosette rotates with the instance
     let total_yaw = clump_yaw + byaw;
     let radir = vec2(cos(total_yaw), sin(total_yaw));
-    let anchor = in.xz + radir * (rk * spread_r);
+    // ground anchor: world (x, z) + ground contact y so blades stand ON
+    // the terrain surface instead of at the y == 0 sea plane
+    let anchor = vec3(in.xz.x, in.uy, in.xz.y)
+        + vec3(radir.x, 0.0, radir.y) * (rk * spread_r);
     // blade plane yaw: spine rotation + blade table yaw + edge jitter
     let plane_yaw = clump_yaw + byaw;
     let side = vec2(cos(plane_yaw), sin(plane_yaw));
@@ -668,13 +732,17 @@ fn vs(in: VIn) -> VOut {
         let dp = clamp((v - peak) / max(1.0 - peak, 1e-3), 0.0, 1.0);
         prof = mix(1.0, tip, pow(dp, 1.35));
     }
-    let base = anchor + side * (lat * prof * in.width * 0.5);
+    // base = anchor + side * (lat * prof * in.width * 0.5); `anchor` is the
+    // GROUND contact vec3 (x, uy, z) so the lateral offset operates on the
+    // horizontal (x, z) pair only — naga rejects vec3 + vec2, and the droop
+    // term writes the rise into wp.y directly below
+    let base_h = vec2(anchor.x, anchor.z) + side * (lat * prof * in.width * 0.5);
     // grass-local visual clock via the spare uniform slot, with a fallback
     // to the world clock until the lead wires spare1.x
     let vt = select(cam.world_wh_time_flash.z, gwin.spare1.x, gwin.spare1.x > 0.0);
     let gust_a = clamp(gwin.wind_gust.z, 0.0, 2.5) * in.sway;
     // coherent per-clump wave (Gems 7.4.4) + per-blade flutter shimmer
-    let wave = sin(vt * 1.8 + (anchor.x + anchor.y) * 0.05 + clump_yaw * 2.0);
+    let wave = sin(vt * 1.8 + (anchor.x + anchor.z) * 0.05 + clump_yaw * 2.0);
     let flut = sin(vt * 5.5 + f32(bid) * 4.7 + in.seed * 11.0);
     var bend = gwin.wind_gust.xy * (h_eff * v * v)
         * (wave * gust_a * 0.55 + flut * gust_a * 0.04);
@@ -696,11 +764,15 @@ fn vs(in: VIn) -> VOut {
     if (blen > h_eff * 0.9) {
         bend = bend * (h_eff * 0.9 / blen);
     }
-    let wp = vec3(base.x + bend.x, v * h_eff - 0.35 * blen * v, base.y + bend.y);
+    let wp = vec3(base_h.x + bend.x, in.uy + v * h_eff - 0.35 * blen * v, base_h.y + bend.y);
     var o: VOut;
     o.clip = cam.proj * cam.view * vec4(wp, 1.0);
     o.world = wp;
-    o.frag = vec4(v, in.hue + jhue + 0.02 * v, in.dim, in.wet);
+    // ALIFE_GRASS_DEBUG=1: per-blade flat hue (blade 0 red, 1 green, 2
+    // blue, ...) in the normal hue slot -> a screenshot instantly shows
+    // blade boundaries / vertex stepping
+    let dbg = gwin.spare2.y > 0.5;
+    o.frag = vec4(v, select(in.hue + jhue + 0.02 * v, f32(bid) * 0.14285715, dbg), in.dim, in.wet);
     o.side = vec3(side.x, 0.0, side.y);
     o.biome = in.biome;
     // shimmer = flutter * gust * 0.12; ao = radial fallback darkening
@@ -724,6 +796,13 @@ struct CamBlock {
     proj: mat4x4<f32>,
     view_pos: vec4<f32>,
     world_wh_time_flash: vec4<f32>,
+};
+@group(1) @binding(0) var<uniform> gwin: GrassGust;
+struct GrassGust {
+    wind_gust: vec4<f32>,   // dir_x, dir_z, gust amp, -
+    trample: vec4<f32>,     // x, z, radius, strength
+    spare1: vec4<f32>,
+    spare2: vec4<f32>,      // debug: (x, red-tint-on-draw, -, -)
 };
 
 fn hsv(h: f32, s: f32, val: f32) -> vec3<f32> {
@@ -787,6 +866,9 @@ fn fs(in: FsIn) -> @location(0) vec4<f32> {
     c = mix(c, vec3(0.55, 0.60, 0.66), fog);
     c *= 1.0 + in.shim.x;
     c += clamp(cam.world_wh_time_flash.w, 0.0, 1.0) * 0.35;
+    // ALIFE_GRASS_DEBUG=1: flat red wash over normal colors (spare2.y set
+    // CPU-side when the env is on) -> grass pixels self-identify
+    c = mix(c, vec3(1.0, 0.05, 0.05), clamp(gwin.spare2.y, 0.0, 1.0) * 0.75);
     return vec4(c, 1.0);
 }
 "#;
