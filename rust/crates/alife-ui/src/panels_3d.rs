@@ -221,6 +221,7 @@ pub fn canvas3d(app: &mut AlifeApp, ui: &mut egui::Ui, rect: Rect) {
     // order so a pick index maps straight back to a real organism id
     let radius = 220.0;
     let mut org_ids: Vec<u64> = Vec::new();
+    let mut org_arch: Vec<u64> = Vec::new();
     let orgs: Vec<OrgInst> = app
         .sim
         .organisms()
@@ -230,6 +231,9 @@ pub fn canvas3d(app: &mut AlifeApp, ui: &mut egui::Ui, rect: Rect) {
         .take(1600)
         .map(|o| {
             org_ids.push(o.id);
+            org_arch.push(alife_view3d::creature_mesh::archetype_key(
+                &alife_common::morphology::derive(o),
+            ));
             alife_view3d::scene::org_instance(
                 o,
                 alife_view3d::morph::brand_of(o),
@@ -404,6 +408,7 @@ pub fn canvas3d(app: &mut AlifeApp, ui: &mut egui::Ui, rect: Rect) {
         viewport_px: (rect.width(), rect.height()),
         follow_target,
         orgs,
+        org_arch,
         rain_cover: rain,
         cloud_cover: cloud,
         flash,

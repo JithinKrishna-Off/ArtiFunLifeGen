@@ -306,3 +306,26 @@ pub fn build() -> Templates {
     Templates { shell, tail, quad }
 }
 
+// --------------------------------------------------------------- A1 region
+// Organism (non-queen) archetype-derived templates. Queen template ranges
+// (QUEEN_VBASE/QUEEN_VCOUNT -> morph_queen) are agent-owned and untouched.
+
+use crate::creature_mesh as cmet;
+
+/// Organism mesh for a real sim-derived descriptor (archetype-cached,
+/// deterministic, built by `creature_mesh`). The renderer agent integrates
+/// these with `creature_mesh::hue_channel` + `RENDER_SCALE * body_length`
+/// as the instance hue/radius (see creature_mesh module docs for the recipe).
+pub fn archetype_mesh(m: &alife_common::morphology::CreatureMorph) -> &'static [TVert] {
+    cmet::archetype_mesh(m)
+}
+
+/// Brand fallback (no sim-derived CreatureMorph available): a generic small
+/// organism per brand rendered at the same silhouette sizes as the legacy
+/// shell/flagella templates (~1.39 world units nominal, in the [0.8, 2.0]
+/// band checked by morph_tests). brand: 0 cell / 1 flagellate / 2 colony /
+/// 3 filament; queen templates stay in `morph_queen` (never here).
+pub fn organism_brand_fallback(brand: u32) -> &'static [TVert] {
+    cmet::brand_fallback(brand)
+}
+

@@ -39,15 +39,30 @@ fn inst_cap(mode: u8) -> usize {
     }
 }
 
-/// jittered clump-anchor candidate attempts per 32x32 chunk (before density drop)
-const CAND_HABITAT: u32 = 340;
-const CAND_PLANET: u32 = 140;
+/// jittered clump-anchor candidate attempts per 32x32 chunk (before density
+/// drop). Phase-1 meadow: the near-ring density rise eats the per-chunk
+/// keep budget, so the candidate pools grew ~2.6-3x; RSA jamming (see the
+/// spacing law below) then saturates on the hash pool instead of starving.
+const CAND_HABITAT: u32 = 900;
+const CAND_PLANET: u32 = 430;
+/// near-ring immersion multipliers, folded into the ring_rate x density x
+/// patch_mask keep path (GrassInst layout unchanged): near +100%, mid +35%,
+/// far ring keeps its previous (zero) rate.
+const NEAR_RATE_MUL: f32 = 2.0;
+const MID_RATE_MUL: f32 = 1.35;
+/// per-chunk keep ceiling, locked to the draw loop's per-chunk instance
+/// budget (grass.rs draws at most 150 clumps per 32x32 chunk) and scaled by
+/// the adaptive lod_scale so fps-driven density relief still flows through
+/// to the near ring (RSA jamming at the 1.5-unit near spacing would
+/// otherwise pin chunk keeps at ~300 and eat the adaptive-density feature).
+const CHUNK_KEEP_CAP: f32 = 150.0;
 /// directional keep factors: the habitat window is small and dense, the
 /// planet window sweeps the whole world so its directional keep drops hard
-/// to hold the worst-case tri budget. Per fertile chunk this keeps the
-/// ~110-130 clump target in the lush near ring.
+/// to hold the worst-case tri budget AND its chunk coverage. Per fertile
+/// chunk the near ring now packs ~140-150 clumps (habitat, cap-bound) /
+/// ~70-80 (planet, coverage-bound).
 const HABITAT_KEEP_MUL: f32 = 2.2;
-const PLANET_KEEP_MUL: f32 = 0.99;
+const PLANET_KEEP_MUL: f32 = 0.48;
 
 /// window + ring radii (near full density, mid 0.4x, beyond = none)
 const WINDOW_ORBIT: f32 = 260.0;
@@ -57,8 +72,24 @@ const WINDOW_PLANET_MARGIN: f32 = 1.05;
 const NEAR_PLANET: f32 = 220.0;
 const MID_PLANET: f32 = 650.0;
 
-/// anti-overlap radius between clump anchors inside one chunk
+/// anti-overlap radius between clump anchors, per density ring: the near
+/// ring interlocks denser (1.5) for the dense-meadow mandate, mid keeps the
+/// classic 2.2 and far separates out to 2.8 for breathability. Enforced in
+/// the per-chunk reject scan with the pair-max radius (below).
 const CLUMP_SPACING: f32 = 2.2;
+const SPACING_NEAR: f32 = 1.5;
+const SPACING_FAR: f32 = 2.8;
+
+/// reject radius for a clump anchor candidate at focus distance `d`
+pub fn spacing_for(d: f32, near: f32, mid: f32) -> f32 {
+    if d < near {
+        SPACING_NEAR
+    } else if d < mid {
+        CLUMP_SPACING
+    } else {
+        SPACING_FAR
+    }
+}
 
 // ------------------------------------------------------------- streaming
 /// streaming: how far clump placement may reach BEYOND the simulated bounds
@@ -452,6 +483,21 @@ pub fn patch_mask(gen: u32, px: f32, pz: f32) -> f32 {
     (0.15 + 0.85 * mixed).clamp(0.0, 1.0)
 }
 
+/// Fertile-aware patch mask for GRASS placement (the shared `patch_mask`
+/// stays untouched because tree placement also consumes it): in the lush
+/// biomes (0/1/4) on fertile-damp ground the bald-patch floor lifts
+/// 0.15 -> 0.30 so sopired meadow gaps soften; rocky/toxic/dry biomes and
+/// harsh fields keep the harsh mask.
+pub fn patch_mask_fertile(gen: u32, px: f32, pz: f32, f: f32, m: f32, biome: u32) -> f32 {
+    let base = patch_mask(gen, px, pz);
+    let b = biome % 6;
+    if (b == 0 || b == 1 || b == 4) && f > 0.55 && m > 0.45 {
+        base.max(0.30)
+    } else {
+        base
+    }
+}
+
 /// hash of (world generation tag, chunk coords, clump index) -> state stream
 pub fn blade_hash(gen: u32, cx: i32, cy: i32, idx: u32) -> u64 {
     let mut s: u64 = 0x4742_5F53; // "GBS" salt
@@ -498,6 +544,20 @@ pub fn ring_rate(d: f32, near: f32, mid: f32) -> f32 {
     }
 }
 
+/// ring rate with the phase-1 immersion multipliers folded in: the near
+/// ring keeps at 2.0x and the mid ring at 1.35x the base directional rate
+/// (folded into the existing ring_rate x density x patch_mask path, so the
+/// `GrassInst` layout is untouched). The far ring stays at zero.
+pub fn ring_rate_mul(d: f32, near: f32, mid: f32) -> f32 {
+    if d < near {
+        NEAR_RATE_MUL
+    } else if d < mid {
+        0.4 * MID_RATE_MUL
+    } else {
+        0.0
+    }
+}
+
 pub fn build(world: &impl WorldSampling, b: &Builder) -> BuildResult {
     let window = window_for(b.mode, world);
     let (near, mid) = rings_for(b.mode, window);
@@ -505,6 +565,8 @@ pub fn build(world: &impl WorldSampling, b: &Builder) -> BuildResult {
     let cands = if b.mode == MODE_PLANET { CAND_PLANET } else { CAND_HABITAT };
     // planet mode sweeps the widest window, so its directional keep drops
     let mode_mul = if b.mode == MODE_PLANET { PLANET_KEEP_MUL } else { HABITAT_KEEP_MUL };
+    // per-chunk keep ceiling (draw-budget lockstep, lod-scale responsive)
+    let chunk_cap = ((CHUNK_KEEP_CAP * b.lod_scale).max(1.0)) as usize;
 
     // streaming: the placement window may hang over the simulated bounds by
     // at most GRASS_MARGIN on each side (was clamped into the world rect);
@@ -529,22 +591,32 @@ pub fn build(world: &impl WorldSampling, b: &Builder) -> BuildResult {
                 continue;
             }
             let mut insts = Vec::new();
-            // anti-overlap: clump anchors placed in this chunk so far
-            let mut placed: Vec<(f32, f32)> = Vec::new();
+            // anti-overlap: clump anchors placed in this chunk so far, with
+            // each anchor's own ring reject radius (pair-max rule below)
+            let mut placed: Vec<(f32, f32, f32)> = Vec::new();
             for i in 0..cands {
                 let mut s = blade_hash(b.gen, cx, cy, i);
+                // streaming: clamped to the streamed margin instead of the
+                // simulated bounds; VirtualWorld sampling keeps these
+                // deterministic and continuous with the engine fields
                 let jx = hash01(&mut s);
                 let jy = hash01(&mut s);
+                let px = (ox + jx * CHUNK).clamp(-GRASS_MARGIN, world.width() + GRASS_MARGIN);
+                let pz = (oy + jy * CHUNK).clamp(-GRASS_MARGIN, world.height() + GRASS_MARGIN);
+                // far-ring candidates can never keep (rate 0): skip before
+                // any field sampling / hash work (planet rebuild cost)
+                let d = ((px - b.focus.0).powi(2) + (pz - b.focus.1).powi(2)).sqrt();
+                if d >= mid {
+                    continue;
+                }
+                // anti-overlap reject radius for this candidate's ring
+                let rr = spacing_for(d, near, mid);
+
                 let slot = hash01(&mut s);
                 let rh = hash01(&mut s);
                 let rw = hash01(&mut s);
                 let rc = hash01(&mut s);
                 let rl = hash01(&mut s);
-                // streaming: clamped to the streamed margin instead of the
-                // simulated bounds; VirtualWorld sampling keeps these
-                // deterministic and continuous with the engine fields
-                let px = (ox + jx * CHUNK).clamp(-GRASS_MARGIN, world.width() + GRASS_MARGIN);
-                let pz = (oy + jy * CHUNK).clamp(-GRASS_MARGIN, world.height() + GRASS_MARGIN);
 
                 let f = world.sample_fertility(px, pz);
                 let m = world.sample_moisture(px, pz);
@@ -553,14 +625,14 @@ pub fn build(world: &impl WorldSampling, b: &Builder) -> BuildResult {
                 let bio = world.biome_id(px, pz) as u32;
 
                 let rule = pick_rule(f, m, hz, e, bio, slot);
-                let d = ((px - b.focus.0).powi(2) + (pz - b.focus.1).powi(2)).sqrt();
-                let rate = ring_rate(d, near, mid)
+                let rate = ring_rate_mul(d, near, mid)
                     * rule.density
                     * b.lod_scale
                     * mode_mul
-                    // global density trim + patch clustering (gaps/ tufts)
+                    // global density trim + patch clustering (gaps/ tufts);
+                    // fertile biomes soften the gap floor (0.15 -> 0.30)
                     * 0.62
-                    * (0.12 + 0.88 * patch_mask(b.gen, px, pz));
+                    * (0.12 + 0.88 * patch_mask_fertile(b.gen, px, pz, f, m, bio));
                 if rate <= f32::EPSILON || rh > rate {
                     continue;
                 }
@@ -569,14 +641,16 @@ pub fn build(world: &impl WorldSampling, b: &Builder) -> BuildResult {
                     continue;
                 }
                 // deterministic anti-overlap against anchors placed in
-                // this chunk (linear scan over a small vec is fine at
-                // ~340 candidates / ~120 keeps per chunk)
+                // this chunk: the pair uses the STRONGER of the two
+                // anchors' ring reject radii, so the kept set satisfies a
+                // clean pairwise invariant (`d >= max(r_a, r_b)`)
                 let (ax, az) = (px, pz);
                 let mut ok = true;
-                for (qx, qz) in &placed {
+                for (qx, qz, qr) in &placed {
                     let ddx = ax - *qx;
                     let ddz = az - *qz;
-                    if ddx * ddx + ddz * ddz < CLUMP_SPACING * CLUMP_SPACING {
+                    let lim = rr.max(*qr);
+                    if ddx * ddx + ddz * ddz < lim * lim {
                         ok = false;
                         break;
                     }
@@ -584,7 +658,7 @@ pub fn build(world: &impl WorldSampling, b: &Builder) -> BuildResult {
                 if !ok {
                     continue;
                 }
-                placed.push((ax, az));
+                placed.push((ax, az, rr));
                 // consume one more hash for the per-clump shape variant so
                 // tint (rc) and shape stay independent
                 let rshape = hash01(&mut s);
@@ -603,6 +677,11 @@ pub fn build(world: &impl WorldSampling, b: &Builder) -> BuildResult {
                     sway: rule.sway,
                     pad: rshape - 0.5,
                 });
+                // per-chunk keep ceiling (draw-budget lockstep): keeps past
+                // the cap could not be drawn, so stop the scan early
+                if insts.len() >= chunk_cap {
+                    break;
+                }
             }
             if !insts.is_empty() {
                 chunks.push(ChunkPlan { cx, cy, insts });
@@ -747,17 +826,27 @@ mod tests {
     #[test]
     fn slope_gate_and_overlap() {
         let world = default_world();
-        // every kept clump must respect the anti-overlap radius inside a chunk
-        let res = build_at(MODE_ORBIT, 900.0, 700.0, &world, 1.0);
+        // every kept clump must respect the per-ring anti-overlap radius:
+        // pairwise distances honor the STRONGER of the two anchors' ring
+        // reject radii (1.5 near / 2.2 mid / 2.8 far)
+        let focus = (900.0_f32, 700.0_f32);
+        let res = build_at(MODE_ORBIT, focus.0, focus.1, &world, 1.0);
+        let (near, mid) = rings_for(MODE_ORBIT, window_for(MODE_ORBIT, &world));
+        let grade = |x: f32, z: f32| {
+            let d = ((x - focus.0).powi(2) + (z - focus.1).powi(2)).sqrt();
+            spacing_for(d, near, mid)
+        };
         for c in &res.chunks {
             let list = &c.insts;
             for (i, a) in list.iter().enumerate() {
                 for other in list.iter().skip(i + 1) {
                     let d2 = (a.x - other.x).powi(2) + (a.z - other.z).powi(2);
+                    let lim = grade(a.x, a.z).max(grade(other.x, other.z));
                     assert!(
-                        d2 >= CLUMP_SPACING * CLUMP_SPACING - 1e-3,
-                        "overlapping clumps at d2 {:.3}",
-                        d2
+                        d2 >= lim * lim - 1e-3,
+                        "overlapping clumps at d2 {:.3} < lim2 {:.3}",
+                        d2,
+                        lim * lim
                     );
                 }
             }
@@ -814,5 +903,90 @@ mod tests {
             }
         }
         assert!(same < 64, "patch_mask ignores the meadow octave");
+    }
+
+    #[test]
+    fn ring_rate_mul_honors_immersion_laws() {
+        let (near, mid) = (105.0_f32, 187.0_f32);
+        // near ring: 2.0x, mid ring: 1.35 x 0.4 = 0.54, far ring: 0
+        assert_eq!(ring_rate_mul(near - 1.0, near, mid), 2.0);
+        assert_eq!(ring_rate_mul(mid - 1.0, near, mid), 0.4 * 1.35);
+        assert_eq!(ring_rate_mul(mid + 10.0, near, mid), 0.0);
+        // base law unchanged for compatibility (tree placement shares it)
+        assert_eq!(ring_rate(near - 1.0, near, mid), 1.0);
+        assert_eq!(ring_rate(mid - 1.0, near, mid), 0.4);
+        assert_eq!(ring_rate(mid + 10.0, near, mid), 0.0);
+    }
+
+    #[test]
+    fn spacing_law_is_ring_dependent() {
+        let (near, mid) = (105.0_f32, 187.0_f32);
+        assert_eq!(spacing_for(near - 1.0, near, mid), 1.5);
+        assert_eq!(spacing_for((near + mid) * 0.5, near, mid), 2.2);
+        assert_eq!(spacing_for(mid + 10.0, near, mid), 2.8);
+    }
+
+    #[test]
+    fn patch_mask_fertile_lifts_floor_only_in_lush_biomes() {
+        // pick a spot, then compare lush vs harsh moods at the same coords
+        let (x, z) = (513.0, 270.0);
+        let f = 0.9_f32;
+        let m = 0.9_f32;
+        let lush = patch_mask_fertile(3, x, z, f, m, 0);
+        let lush_plains = patch_mask_fertile(3, x, z, f, m, 1);
+        let lush_basin = patch_mask_fertile(3, x, z, f, m, 4);
+        let rocky = patch_mask_fertile(3, x, z, f, m, 2);
+        let toxic = patch_mask_fertile(3, x, z, f, m, 3);
+        for v in [lush, lush_plains, lush_basin] {
+            assert!(v >= 0.30, "fertile-biome floor must lift to 0.30: {v}");
+        }
+        for v in [rocky, toxic] {
+            assert_eq!(v, patch_mask(3, x, z), "harsh biomes keep the harsh mask");
+        }
+        // low fertility/moisture keeps the harsh mask everywhere
+        assert_eq!(
+            patch_mask_fertile(3, x, z, 0.5, 0.9, 0),
+            patch_mask(3, x, z)
+        );
+        assert_eq!(
+            patch_mask_fertile(3, x, z, 0.9, 0.44, 0),
+            patch_mask(3, x, z)
+        );
+    }
+
+    #[test]
+    fn per_chunk_keeps_respect_draw_budget_cap() {
+        let world = default_world();
+        // saturating lush foci: keeps must stay at the per-chunk ceiling
+        // (== the draw loop's 150/chunk budget) instead of RSA-maxing out
+        for (fx, fz) in [(900.0, 700.0), (1200.0, 800.0), (500.0, 500.0)] {
+            let res = build_at(MODE_ORBIT, fx, fz, &world, 1.0);
+            for c in &res.chunks {
+                assert!(
+                    c.insts.len() <= 150,
+                    "chunk ({},{}) keeps {} > per-chunk draw budget 150",
+                    c.cx,
+                    c.cy,
+                    c.insts.len()
+                );
+            }
+        }
+        // adaptive density must stay responsive: a lowered lod_scale also
+        // lowers the per-chunk ceiling (RSA jamming at 1.5 near spacing
+        // would otherwise pin chunk counts ~300 and eat the LOD feature)
+        let full = build_at(MODE_ORBIT, 900.0, 700.0, &world, 1.0);
+        let thin = build_at(MODE_ORBIT, 900.0, 700.0, &world, 0.4);
+        let chunk_full: Vec<usize> = full.chunks.iter().map(|c| c.insts.len()).collect();
+        let chunk_thin: Vec<usize> = thin.chunks.iter().map(|c| c.insts.len()).collect();
+        for (pair, (a, b)) in chunk_full.iter().zip(chunk_thin.iter()).enumerate() {
+            assert!(
+                b <= a,
+                "lod_scale must not raise any chunk's keep count (chunk {pair}: {b} > {a})"
+            );
+        }
+        assert!(
+            thin.total < full.total,
+            "lower lod_scale must drop resident clumps"
+        );
     }
 }

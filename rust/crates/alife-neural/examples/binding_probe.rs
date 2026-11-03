@@ -12,7 +12,7 @@ fn main() {
     let Some(path) = path else { eprintln!("artifact missing"); std::process::exit(1) };
     let conn = alife_neural::connectome_binary::load(&path).expect("load");
     eprintln!("n={} regions={}", conn.n(), conn.regions.len());
-    match alife_neural::queen_adapter::propose_region_binding(&conn, 2) {
+    match alife_neural::queen_adapter::propose_region_binding(&conn, 2, None) {
         Some((binding, classes)) => {
             eprintln!("binding len {}", binding.len());
             for c in &classes {
@@ -22,3 +22,4 @@ fn main() {
         None => eprintln!("proposal: None"),
     }
 }
+

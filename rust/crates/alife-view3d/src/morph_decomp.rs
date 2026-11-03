@@ -103,8 +103,17 @@ fn shortest_angle(from: f32, to: f32) -> f32 {
 pub const INST_CAP: usize =
     SHELL_CAP as usize + TAIL_CAP as usize + QUAD_CAP as usize + QUEEN_CAP;
 
-/// instance record: 14 x f32 = 56 bytes, bytemuck Pod
-pub const INST_FLOATS: usize = 14;
+/// instance record: 22 x f32 = 88 bytes, bytemuck Pod. Decode order =
+/// WGSL instance attributes (morph.rs VS): locations 2..=13 are the legacy
+/// 14 floats (ipos vec3 @2, scalars @3..=13), the A3 locomotion extension
+/// appends `motion` (vec4 @14..=17) and `drive` (vec4 @18..=21). Row lanes
+/// that never animate keep every extension field at 0.0:
+/// - queen lane (reserved template; settled queen motion, pad 0/1)
+/// - legacy tail/shell/billboard planner lanes (CPU diagnostics only) and
+///   the organism blob lane (pad 0) — the VS creature gate
+///   `pad in (0.0, 0.5)` excludes them, ordinary archetype rows carry
+///   sat_tint there and animate.
+pub const INST_FLOATS: usize = 22;
 pub const INST_STRIDE: usize = INST_FLOATS * 4;
 
 pub const MODE_ORBIT: u8 = 0;
@@ -159,6 +168,22 @@ pub struct MorphInst {
     /// collapsed, abdominal ridge pulse damped) while the body+crown
     /// silhouette stays identical. Always 0.0 for non-queen instances.
     pub pad: f32,
+    // ------------------------------------------------ A3 locomotion (append-only)
+    /// (bob_y, pitch, roll, stride_phase): vertical body bob in WORLD units
+    /// (added +Y by the VS after grounding so the body lifts above the
+    /// terrain-seat), small-angle pitch/roll in radians, and the accrued
+    /// stride phase in radians (per-organism position-delta acceleration +
+    /// per-instance desync seed; the VS derives per-leg offsets from the
+    /// limb's template x/y slot). Zero for idle rows / never-animated lanes.
+    pub motion: [f32; 4],
+    /// (leg_swing, leg_lift, walk_squash, breathe): limb stride swing and
+    /// vertical lift amplitudes in WORLD units (Consumed only by CODE_LIMB
+    /// verts below the trunk midline — antennae are excluded by template
+    /// y sign), the phase-locked squash-stretch amplitude for walk cycles
+    /// (strongest on Primitive bodies, damped by armour) and the slow
+    /// ambient breathing amplitude (idle `LOCO_IDLE_BREATHE`). Zero except
+    /// `breathe` on idle rows.
+    pub drive: [f32; 4],
 }
 
 /// A sub-cell of an organism expressed at (brand, hue, size): local offset +
@@ -322,6 +347,280 @@ fn wave_rate(brand: u32, turgor01: f32) -> f32 {
         _ => 1.6 + 0.6 * turgor01,
     }
 }
+
+// ================================================================ A3 locomotion
+// Procedural body motion ON TOP of the authoritative planner row (view-side
+// only: sim positions/headings are never mutated; sway rides the row's own
+// heading float). Pure functions of (body plan, body length, speed, phase)
+// plus per-organism phase/gait state accumulated from actual position
+// deltas (same estimator pattern as the queen lane below).
+//
+// Speed scale note: the ordinary archetype silhouette is ~1/12 of the
+// queen's 16-unit giant, so the walk bands are ABSOLUTE world units tuned
+// to the queen's QUEEN_GAIT_REF divisor rather than trait-speed units.
+
+/// below this speed (world u/s) an organism is idle: bob/pitch/roll/legs
+/// zero out, only the ambient breathe remains
+pub const LOCO_IDLE_EPS: f32 = 1.5;
+/// speed (world u/s) where the gait is fully engaged (amplitude/taper 1.0)
+pub const LOCO_FULL: f32 = 22.0;
+/// stride frequency = clamp(LOCO_FREQ_K / body_len, LOCO_F_MIN, LOCO_F_MAX)
+/// Hz — small creatures wiggle faster (small-bl bodies push the 9 Hz cap)
+pub const LOCO_FREQ_K: f32 = 6.0;
+pub const LOCO_F_MIN: f32 = 1.2;
+pub const LOCO_F_MAX: f32 = 9.0;
+/// body bob at full speed, in body-length fraction (world units = * body_len)
+pub const LOCO_BOB: f32 = 0.055;
+/// per-plan bob scale: Primitive floats/squashes, arthropods bound,
+/// multi-legged amble, quadruped full diagonal-pair bounce
+const BOB_PLAN_SCALE: [f32; 4] = [0.30, 1.00, 0.85, 1.00];
+/// jointedness (floppy limbs) smooths the gait: bob reduced by this fraction
+pub const LOCO_JOINT_DAMP: f32 = 0.6;
+/// pitch couples the bob derivative; clamped to LOCO_PITCH_MAX radians
+pub const LOCO_PITCH_K: f32 = 0.5;
+pub const LOCO_PITCH_MAX: f32 = 0.12;
+/// yaw sway at full speed (radians) - applied to the row's heading only
+pub const LOCO_SWAY: f32 = 0.06;
+/// per-plan sway boost (multi-legged amble sways hardest)
+const SWAY_PLAN_BOOST: [f32; 4] = [1.0, 1.0, 1.5, 1.0];
+/// roll couples the sway derivative, clamped to LOCO_ROLL_MAX radians
+pub const LOCO_ROLL_K: f32 = 1.1;
+pub const LOCO_ROLL_MAX: f32 = 0.16;
+/// limb stride swing at full speed, body-length fraction (* body_len for
+/// world units); lift is LOCO_LEG_LIFT of it
+pub const LOCO_LEG_AMP: f32 = 0.16;
+pub const LOCO_LEG_LIFT: f32 = 0.55;
+/// per-plan leg scale: Primitive is limbless, arthropod tripod tread at
+/// full swing, multi-legged short strides, quadruped diagonal pairs
+const LEG_PLAN_SCALE: [f32; 4] = [0.0, 1.00, 0.85, 1.00];
+/// jointed limbs swing a touch less (knees absorb)
+pub const LOCO_LEG_JOINT_DAMP: f32 = 0.3;
+/// walk squash-stretch amplitude (Primitive bodies squash hardest;
+/// armour plating stiffens the shell by LOCO_ARMOUR_DAMP)
+pub const LOCO_SQUASH_WALK: f32 = 0.05;
+pub const LOCO_SQUASH_BODY: f32 = 0.012;
+pub const LOCO_ARMOUR_DAMP: f32 = 0.5;
+/// idle ambient breathing scale amplitude (1 +- THIS in the VS)
+pub const LOCO_IDLE_BREATHE: f32 = 0.02;
+/// ambient breathe while walking is shallower than the full idle swell
+pub const LOCO_WALK_BREATHE: f32 = 0.008;
+/// idle yaw-twitch amplitude (antennae/eyestalk approximation; view-side
+/// heading jitter, sim heading untouched)
+pub const LOCO_IDLE_TWITCH: f32 = 0.012;
+/// speed smoothing per frame (lerp factor toward the instantaneous estimate)
+pub const LOCO_SPEED_LERP: f32 = 0.35;
+/// beyond this squared per-frame position jump (40 u at the classic 1/60 s)
+/// the organism is treated as teleported/spawned: speed resets, phase lives
+pub const LOCO_TELEPORT2: f32 = 1600.0;
+/// idle stride-phase drift (fraction of the walking rate)
+pub const LOCO_IDLE_RATE: f32 = 0.25;
+/// hard track cap (LRU-ish: the per-pass prune makes the steady-state map
+/// hold exactly the live organism count)
+pub const LOCO_TRACK_CAP: usize = 4096;
+
+/// stride frequency in Hz for a visible body length (world units).
+pub fn gait_freq(body_len: f32) -> f32 {
+    (LOCO_FREQ_K / body_len.max(0.05)).clamp(LOCO_F_MIN, LOCO_F_MAX)
+}
+
+/// Per-leg stride phase offsets the VS derives from the limb's raw template
+/// slot (mirrored in WGSL; keep in lockstep):
+/// - x slot bucket: x >= 0 => front (+0), -0.24 <= x < 0 => mid (+PI/2),
+///   x < -0.24 => rear (+PI)
+/// - z side parity: z > 0 => +0, z <= 0 => +PI (left/right anti-phase rows;
+///   with front/rear buckets this yields diagonal pairs = trot, and with
+///   mid rows a tripod-ish tread using appendage parity)
+pub fn leg_bucket_offset(template_x: f32) -> f32 {
+    if template_x < -0.24 {
+        std::f32::consts::PI
+    } else if template_x < 0.0 {
+        std::f32::consts::FRAC_PI_2
+    } else {
+        0.0
+    }
+}
+
+/// VS mirror: limb template z side -> parity offset (radians).
+pub fn leg_side_parity(template_z: f32) -> f32 {
+    if template_z > 0.0 { 0.0 } else { std::f32::consts::PI }
+}
+
+/// Pure per-frame body-motion output for one organism row. `phase` is the
+/// ACCRUED stride phase (radians, includes the per-instance desync seed);
+/// `body_len` is the visible body extension in world units (the instance
+/// radius for archetype rows); `plan` is the BodyPlan discriminant
+/// (0..3): 0 Primitive, 1 SegmentedArthropod, 2 MultiLegged, 3 Quadruped.
+/// Deterministic: same inputs -> identical fields (testable without GPU).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Motion {
+    /// world-unit +Y lift (added by the VS after grounding)
+    pub bob: f32,
+    /// small-angle pitch (rad, ~ bob derivative)
+    pub pitch: f32,
+    /// small-angle roll (rad, ~ sway derivative)
+    pub roll: f32,
+    /// stride phase in radians (write-through, drives VS leg offsets)
+    pub phase: f32,
+    /// limb swing amplitude in world units (CODE_LIMB verts only)
+    pub leg_amp: f32,
+    /// limb vertical lift amplitude in world units
+    pub leg_lift: f32,
+    /// phase-locked walk squash amplitude (scale_y 1 +- s)
+    pub squash: f32,
+    /// slow ambient breathing amplitude (scale_y 1 +- s)
+    pub breathe: f32,
+    /// yaw sway in radians (view-side heading offset)
+    pub sway: f32,
+}
+
+/// See [`Motion`]/the LOCO_* constant docs. `speed` is the smoothed
+/// per-organism speed estimate (world u/s, position delta per frame / dt).
+pub fn motion_for(plan: u8, body_len: f32, speed: f32, phase: f32, jointedness: f32, armour: f32) -> Motion {
+    let p = (plan as usize).min(3);
+    let bl = body_len.max(0.05);
+    let f = gait_freq(bl);
+    let walking = speed > LOCO_IDLE_EPS;
+    let sp01 = if walking { (speed / LOCO_FULL).clamp(0.0, 1.0) } else { 0.0 };
+    let joint = jointedness.clamp(0.0, 1.0);
+    let arm = armour.clamp(0.0, 1.0);
+    let two_pi_f = std::f32::consts::TAU * f;
+
+    // yaw sway (view-side heading offset) + roll coupling of its derivative
+    let sway_amp = LOCO_SWAY * sp01 * SWAY_PLAN_BOOST[p];
+    let sway = sway_amp * (0.5 * phase).sin();
+    let roll = (LOCO_ROLL_K * sway_amp * (0.5 * phase).cos()).clamp(-LOCO_ROLL_MAX, LOCO_ROLL_MAX);
+
+    // body bob ~ speed; jointed bodies absorb; pitch ~ bob velocity
+    let bob_amp = LOCO_BOB * sp01 * (1.0 - LOCO_JOINT_DAMP * joint) * BOB_PLAN_SCALE[p] * bl;
+    let bob = bob_amp * phase.sin();
+    let pitch = (LOCO_PITCH_K * two_pi_f * bob_amp / bl.max(0.05) * phase.cos())
+        .clamp(-LOCO_PITCH_MAX, LOCO_PITCH_MAX);
+
+    // limb stride: plan-scaled swing + lift (quadruped diagonal pairs and
+    // the arthropod mid-row offset imply the tripod tread via the VS bucket
+    // + side-parity tables; the head nod anti-phase rides the CODE_HEAD id)
+    let leg_scale = LEG_PLAN_SCALE[p] * (1.0 - LOCO_LEG_JOINT_DAMP * joint);
+    let leg_amp = if walking { LOCO_LEG_AMP * sp01 * leg_scale * bl } else { 0.0 };
+    let leg_lift = leg_amp * LOCO_LEG_LIFT;
+
+    // squash-stretch: Primitive bodies breathe hardest while walking
+    // (shell-plating stiffens), tighter body squash for the others
+    let squash_w = if walking {
+        let base = if p == 0 { LOCO_SQUASH_WALK } else { LOCO_SQUASH_BODY };
+        base * sp01 * (1.0 - LOCO_ARMOUR_DAMP * arm)
+    } else {
+        0.0
+    };
+    // ambient breathe: full idle swell, shallow while moving
+    let breathe = if walking { LOCO_WALK_BREATHE } else { LOCO_IDLE_BREATHE };
+
+    Motion { bob, pitch, roll, phase, leg_amp, leg_lift, squash: squash_w, breathe, sway }
+}
+
+/// Per-organism view-side locomotion state keyed by the sim id
+/// (`OrgInst.id`). Advancing an id consumes the planner's position delta
+/// against the cached previous position (speed = delta / frame_dt, same
+/// estimator pattern as the queen lane), smooths the estimate and accrues
+/// the stride phase at the body-planned frequency. Dead ids are pruned by a
+/// generation stamp on every pass so the map holds exactly the live set.
+#[derive(Clone, Copy)]
+struct LocoTrack {
+    px: f32,
+    py: f32,
+    /// smoothed speed estimate (world u/s)
+    speed: f32,
+    /// accrued stride phase (radians)
+    phase: f32,
+    gen: u64,
+}
+
+pub struct LocoTracks {
+    map: HashMap<u64, LocoTrack>,
+    /// engine frame dt (seconds); gait speed = distance/dt
+    dt: f32,
+    /// per-pass stamp (see [`LocoTracks::begin_pass`])
+    pass: u64,
+}
+
+impl LocoTracks {
+    pub fn new() -> LocoTracks {
+        LocoTracks { map: HashMap::with_capacity(1024), dt: 1.0 / 60.0, pass: 0 }
+    }
+
+    /// Engine frame dt (seconds); NaN/negative dt is ignored (previous value
+    /// stays, default 1/60); capped at 0.25 s like the queen lane. Visual-only.
+    pub fn set_frame_dt(&mut self, dt: f32) {
+        if dt.is_finite() && dt > 0.0 {
+            self.dt = dt.min(0.25);
+        }
+    }
+
+    /// Bumps the pass stamp. Call once at the start of every plan:
+    /// every id advanced in this pass is stamped with the new value, so
+    /// [`LocoTracks::prune`] (at the pass end) drops exactly the dead set.
+    pub fn begin_pass(&mut self) {
+        self.pass = self.pass.wrapping_add(1);
+    }
+
+    /// Advances one organism's state from its new position. Returns
+    /// `(accrued_phase, smoothed_speed)`; callers add the per-instance
+    /// desync seed to the phase. ids that never advance in a pass keep
+    /// their state across LOD hops; the first frame of a new id starts at
+    /// rest so there is no speed spike.
+    pub fn advance(&mut self, id: u64, x: f32, y: f32) -> (f32, f32) {
+        let p = self.pass;
+        let dt = self.dt;
+        let st = self.map.entry(id).or_insert(LocoTrack {
+            px: x,
+            py: y,
+            speed: 0.0,
+            phase: 0.0,
+            gen: p,
+        });
+        st.gen = p;
+        let dx = x - st.px;
+        let dy = y - st.py;
+        let d2 = dx * dx + dy * dy;
+        st.px = x;
+        st.py = y;
+        if d2.is_finite() && d2 < LOCO_TELEPORT2 {
+            let inst = (d2.sqrt() / dt.max(1e-4)).max(0.0);
+            st.speed += (inst - st.speed) * LOCO_SPEED_LERP;
+        } else {
+            st.speed = 0.0; // teleport/spawn: no speed spike
+        }
+        // stride phase advances only while moving (idle limbs settle frozen;
+        // parked ids keep the bytes stable across replans). Engagement cap:
+        // rate tapers by gait engagement during spin-up.
+        if st.speed > LOCO_IDLE_EPS {
+            let gait01 = (st.speed / LOCO_FULL).clamp(0.0, 1.0);
+            let rate = LOCO_IDLE_RATE + (1.0 - LOCO_IDLE_RATE) * gait01;
+            st.phase += std::f32::consts::TAU * rate * dt;
+        }
+        if !st.phase.is_finite() {
+            st.phase = 0.0;
+            st.speed = 0.0;
+        }
+        if st.phase > std::f32::consts::TAU * 1024.0 {
+            st.phase = st.phase.rem_euclid(std::f32::consts::TAU * 1024.0);
+        }
+        (st.phase, st.speed)
+    }
+
+    /// Per-pass prune: every advanced id was stamped with the current pass
+    /// stamp (see [`LocoTracks::begin_pass`]), so a single retain drops
+    /// exactly the dead set. Beyond [`LOCO_TRACK_CAP`] the whole map resets
+    /// (bounded state over continuity).
+    pub fn prune(&mut self) {
+        if self.map.len() >= LOCO_TRACK_CAP {
+            self.map.clear();
+            return;
+        }
+        let p = self.pass;
+        self.map.retain(|_, t| t.gen >= p);
+    }
+}
+
 
 /// Bounded per-frame planner. Every scratch buffer lives for the whole
 /// program lifetime: after the warm-up frame, `plan` runs with no fresh heap
@@ -521,6 +820,8 @@ impl Planner {
                 turgor: 0.35 + 0.65 * e,
                 wave, // idle pulse scaled up with movement (gait speed)
                 pad: if d2 < lod_ring2 { 1.0 } else { 0.0 },
+                motion: [0.0; 4],
+                drive: [0.0; 4],
             });
             // grass-trample footprint of the nearest on-screen queen
             if self.queen_foot.is_none() {
@@ -574,6 +875,8 @@ impl Planner {
                         turgor,
                         wave: rate,
                         pad: 0.0,
+                        motion: [0.0; 4],
+                        drive: [0.0; 4],
                     });
                 }
                 for s in &shells {
@@ -593,6 +896,8 @@ impl Planner {
                         turgor,
                         wave: rate,
                         pad: 0.0,
+                        motion: [0.0; 4],
+                        drive: [0.0; 4],
                     });
                 }
             } else {
@@ -634,6 +939,8 @@ impl Planner {
                 turgor: 0.35 + 0.65 * e,
                 wave: 0.0,
                 pad: 0.0,
+                motion: [0.0; 4],
+                drive: [0.0; 4],
             });
         }
 

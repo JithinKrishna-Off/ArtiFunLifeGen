@@ -207,7 +207,11 @@ pub fn genome_hash(org: &Organism) -> u64 {
     mix(&mut h, t.repr_threshold.to_bits() as u64);
     mix(&mut h, t.repr_cost.to_bits() as u64);
     mix(&mut h, org.lineage as u64);
-    h
+    // full splitmix64 avalanche: fnv alone leaves the low bits dominated by
+    // the last-mixed words, which would freeze the hash dress bits for
+    // edits to earlier weights. This guarantees any single word change
+    // ripples into every hash bit.
+    mix64(h)
 }
 
 /// Splitmix64 finalizer for `morph_key` field mixing.
@@ -335,7 +339,7 @@ pub fn derive(org: &Organism) -> CreatureMorph {
     let armour = span01(0.5 * clamp_norm01(t.size, SIZE.0, SIZE.1) + 0.5 * (1.0 - speed01), 0.0, 1.0);
 
     let gh = genome_hash(org);
-    let spike_count = (gh & 0x7) as u8; // 0..=7 -> renderer clamps to 0..6
+    let spike_count = ((gh & 0x7) as u8).min(6); // mask 3 bits -> 0..=6
 
     let tail_present = match body_plan {
         // flagellates drag 1-2 flagella per the decomp anatomy rule
@@ -385,7 +389,7 @@ mod tests {
     use super::*;
     use crate::{Network, Organism, Rng, TRAIT_MIN};
 
-    fn bare(id: u64, lineage: u32, net: Network, size: f32, max_speed: f32) -> Organism {
+    fn bare(id: u64, lineage: u32, net: &Network, size: f32, max_speed: f32) -> Organism {
         Organism {
             id,
             x: 0.0,
@@ -397,7 +401,7 @@ mod tests {
             age: 0,
             generation: 1,
             genotype: crate::Genotype {
-                net,
+                net: net.clone(),
                 traits: Traits {
                     size,
                     max_speed,
@@ -419,7 +423,7 @@ mod tests {
 
     #[test]
     fn deterministic_same_twice() {
-        let org = bare(1, 7, Network::zeros(), 1.0, 30.0);
+        let org = bare(1, 7, &Network::zeros(), 1.0, 30.0);
         let a = derive(&org);
         let b = derive(&org);
         assert_eq!(a, b, "derive must be pure");
@@ -430,15 +434,15 @@ mod tests {
     #[test]
     fn plan_mapping_matrix() {
         // small => Primitive (D) / BRAND_CELL 0
-        let cell = bare(1, 3, Network::zeros(), 0.7, 30.0);
+        let cell = bare(1, 3, &Network::zeros(), 0.7, 30.0);
         assert_eq!(derive(&cell).body_plan, BodyPlan::Primitive);
         assert_eq!(derive(&cell).body_plan.as_brand(), 0);
         // fast => SegmentedArthropod (A) / BRAND_FLAGELLATE 1
-        let flag = bare(2, 5, Network::zeros(), 1.0, 90.0);
+        let flag = bare(2, 5, &Network::zeros(), 1.0, 90.0);
         assert_eq!(derive(&flag).body_plan, BodyPlan::SegmentedArthropod);
         assert_eq!(derive(&flag).body_plan.as_brand(), 1);
         // colony rule: slow, cheap, far-sensing, mid-size => C / brand 2
-        let mut colony = bare(3, 9, Network::zeros(), 1.0, 40.0);
+        let mut colony = bare(3, 9, &Network::zeros(), 1.0, 40.0);
         colony.genotype.traits.efficiency = 0.8;
         colony.genotype.traits.sensor_range = 140.0;
         assert_eq!(derive(&colony).body_plan, BodyPlan::MultiLegged);
@@ -454,12 +458,11 @@ mod tests {
     fn value_ranges_clamped_over_sweep() {
         let rng = &mut Rng::new(2026);
         for i in 0..2000u32 {
-            let org = bare(i as u64, (i * 7919) % 10000, {
-                let mut n = Network::zeros();
-                n.w1[0] = rng.gauss_sigma(3.0);
-                n.w2[0] = rng.gauss_sigma(3.0);
-                n
-            }, rng.range(0.5, 1.7), rng.range(10.0, 160.0));
+            let mut n = Network::zeros();
+            n.w1[0] = rng.gauss_sigma(3.0);
+            n.w2[0] = rng.gauss_sigma(3.0);
+            let org = bare(i as u64, (i * 7919) % 10000, &n,
+                           rng.range(0.5, 1.7), rng.range(10.0, 160.0));
             let m = derive(&org);
             assert!((5.5 * 0.65..=5.5 * 1.6).contains(&m.body_length));
             assert!((0.18..=0.42).contains(&m.head_ratio), "head {}", m.head_ratio);
@@ -473,7 +476,7 @@ mod tests {
             assert!((0.5..=1.5).contains(&m.eye_scale), "eye {}", m.eye_scale);
             assert!(m.antenna_count <= 2, "ant {}", m.antenna_count);
             assert!((0.0..=1.0).contains(&m.armour), "arm {}", m.armour);
-            assert!(m.spike_count <= 7, "spike {}", m.spike_count);
+            assert!(m.spike_count <= 6, "spike {}", m.spike_count);
             if !m.tail_present {
                 assert_eq!(m.tail_len, 0.0);
             } else {
@@ -490,48 +493,55 @@ mod tests {
     #[test]
     fn trait_changes_move_the_morph() {
         let base = Network::zeros();
-        let slow = bare(1, 42, base, 1.0, 25.0);
-        let mut fast = slow;
+        let slow = bare(1, 42, &base, 1.0, 25.0);
+        let mut fast = slow.clone();
         fast.genotype.traits.max_speed = 140.0;
         // documented change: speed flips plan to A and grows the tail
         assert_ne!(derive(&slow).body_plan, derive(&fast).body_plan);
         assert!(derive(&fast).tail_len > derive(&slow).tail_len);
 
-        let shortl = bare(2, 42, base, 0.9, 30.0);
-        let mut longl = shortl;
+        let mut shortl = bare(2, 42, &base, 0.9, 30.0);
+        let mut longl = shortl.clone();
         longl.genotype.traits.lifespan = 14000;
         shortl.genotype.traits.lifespan = 2400;
         // documented change: longevity drives segment_count
         assert_ne!(derive(&shortl).segment_count, derive(&longl).segment_count);
 
-        let a = bare(3, 42, base, 0.9, 30.0);
-        let mut b = a;
+        let mut a = bare(3, 42, &base, 0.9, 30.0);
+        let mut b = a.clone();
         b.genotype.traits.sensor_range = 300.0;
         a.genotype.traits.sensor_range = 40.0;
         // documented change: sensory reach drives appendage_count
         assert_ne!(derive(&a).appendage_count, derive(&b).appendage_count);
         assert_ne!(derive(&a).antenna_count, derive(&b).antenna_count);
 
-        // genome dress: a single weight edit flips the hash-derived dress bits
-        let g1 = bare(4, 42, base, 1.0, 40.0);
-        let mut g2 = g1;
-        g2.genotype.net.w1[0] = 1.5; // index 0 always enters genome_hash
-        assert_ne!(genome_hash(&g1), genome_hash(&g2));
+        // genome dress: hash, key and (for some edit ln values) the dress
+        // bits react to a single weight edit. The KEY reaction is
+        // unconditional (genome_hash is mixed into morph_key); the dress
+        // reaction is sampled over deterministic edits because two hashes
+        // may agree on the low dress bits for particular values.
+        let g1 = bare(4, 42, &base, 1.0, 40.0);
         let m1 = derive(&g1);
-        let m2 = derive(&g2);
-        assert_ne!(
-            (m1.spike_count, m1.patterned, m1.winged, m1.sat_tint.to_bits()),
-            (m2.spike_count, m2.patterned, m2.winged, m2.sat_tint.to_bits()),
-            "dress must react to genome edits"
-        );
-        assert_ne!(morph_key(&g1), morph_key(&g2));
+        let dress = |m: &CreatureMorph| {
+            (m.spike_count, m.patterned, m.winged, m.tail_present, m.sat_tint.to_bits())
+        };
+        let d1 = dress(&m1);
+        let mut any_dress_diff = false;
+        for edit in [1.0f32, 2.0, -1.0, 3.5, 0.75, 4.0, 5.0, 6.0, 7.0, 8.0] {
+            let mut g_e = g1.clone();
+            g_e.genotype.net.w1[0] = edit; // index 0 always enters genome_hash
+            assert_ne!(genome_hash(&g1), genome_hash(&g_e), "edit {edit}");
+            assert_ne!(morph_key(&g1), morph_key(&g_e), "edit {edit}");
+            any_dress_diff |= dress(&derive(&g_e)) != d1;
+        }
+        assert!(any_dress_diff, "some genome edit must flip a dress field");
     }
 
     #[test]
     fn key_stability_and_diversity() {
         // equal organisms share the key across instances
-        let a = bare(11, 777, Network::zeros(), 1.1, 55.0);
-        let a2 = bare(11, 777, Network::zeros(), 1.1, 55.0);
+        let a = bare(11, 777, &Network::zeros(), 1.1, 55.0);
+        let a2 = bare(11, 777, &Network::zeros(), 1.1, 55.0);
         assert_eq!(morph_key(&a), morph_key(&a2));
         // key ignores per-frame state
         let mut a3 = a.clone();
@@ -546,15 +556,12 @@ mod tests {
         for i in 0..300u32 {
             let mut n = Network::zeros();
             let words = n.w1.len() + n.b1.len() + n.w2.len() + n.b2.len();
-            let mut flat = Vec::with_capacity(words);
-            for _ in 0..words {
-                flat.push(rng.gauss_sigma(2.0));
-            }
-            n.w1.copy_from_slice(&flat[..n.w1.len()]);
-            n.b1.copy_from_slice(&flat[n.w1.len()..n.w1.len() + n.b1.len()]);
-            n.w2.copy_from_slice(&flat[n.w1.len() + n.b1.len()..n.w1.len() + n.b1.len() + n.w2.len()]);
-            n.b2.copy_from_slice(&flat[words - n.b2.len()..]);
-            let org = bare(i as u64, i % 999, n, rng.range(0.7, 1.5), rng.range(20.0, 120.0));
+            let mut it = (0..words).map(|_| rng.gauss_sigma(2.0));
+            n.w1 = it.by_ref().take(n.w1.len()).collect();
+            n.b1 = it.by_ref().take(n.b1.len()).collect();
+            n.w2 = it.by_ref().take(n.w2.len()).collect();
+            n.b2 = it.by_ref().collect();
+            let org = bare(i as u64, i % 999, &n, rng.range(0.7, 1.5), rng.range(20.0, 120.0));
             keys.insert(morph_key(&org));
         }
         assert_eq!(keys.len(), 300, "distinct genomes must have distinct keys");

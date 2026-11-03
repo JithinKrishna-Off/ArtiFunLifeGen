@@ -65,7 +65,7 @@ fn main() {
     }
 
     // candidate motor classes (same proposal the adapter installs)
-    let (_, classes) = alife_neural::queen_adapter::propose_region_binding(&conn, 2)
+    let (_, classes) = alife_neural::queen_adapter::propose_region_binding(&conn, 2, None)
         .expect("region proposal");
     let budget_deg = 2usize; // decode driver: advances per measurement tick
 
@@ -319,3 +319,4 @@ fn main() {
         }
     }
 }
+

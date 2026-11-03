@@ -21,6 +21,8 @@
 //! - `scene.rs`    snapshot types                          (coordinator)
 
 pub mod camera;
+/// Procedural organism anatomy from `CreatureMorph` (Agent A1; non-queen).
+pub mod creature_mesh;
 pub mod grass;
 pub mod grass_clump;
 pub mod morph;

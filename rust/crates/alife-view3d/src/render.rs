@@ -135,6 +135,7 @@ fn frame_snap(f: &Frame3D) -> Frame3D {
         viewport_px: f.viewport_px,
         follow_target: f.follow_target,
         orgs: f.orgs.clone(),
+        org_arch: f.org_arch.clone(),
         rain_cover: f.rain_cover,
         cloud_cover: f.cloud_cover,
         flash: f.flash,

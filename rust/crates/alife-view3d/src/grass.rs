@@ -648,10 +648,11 @@ struct VIn {
 struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
-    @location(1) frag: vec4<f32>,   // (v, hue(+jitter+tip dry), dim, wet)
+    @location(1) frag: vec4<f32>,   // (v, hue(+jitters+tip dry), dim, wet)
     @location(2) side: vec3<f32>,   // in-plane lateral direction of the blade
     @location(3) biome: f32,
     @location(4) shim: vec2<f32>,   // (wind-light shimmer flutter, radial AO)
+    @location(5) tint: vec2<f32>,   // per-clump hue-jitter/sat offsets (seed hash)
 }
 
 const TAU: f32 = 6.2831853;
@@ -700,6 +701,10 @@ fn vs(in: VIn) -> VOut {
     let jrad = (hash_blend(in.seed, bid * 4u + 1u) * 2.0 - 1.0) * 0.08;
     let jhs  = (hash_blend(in.seed, bid * 4u + 2u) * 2.0 - 1.0) * 0.07;
     let jhue = (hash_blend(in.seed, bid * 4u + 3u) * 2.0 - 1.0) * 0.008;
+    // per-CLUMP saturation/khaki variation from the clump seed hash
+    // (same slot for every blade -> one coherent clump voice)
+    let jsat = (hash_blend(in.seed, 99u) - 0.5) * 0.04;
+    let jhue_clump = (hash_blend(in.seed, 98u) - 0.5) * 0.015;
     let byaw = yaw_tbl[bid] + jyaw;
     let rk = clamp(rad_tbl[bid] + jrad, 0.0, 1.0);
     let hs = max(hs_tbl[bid] + jhs, 0.3);
@@ -770,11 +775,17 @@ fn vs(in: VIn) -> VOut {
     o.world = wp;
     // ALIFE_GRASS_DEBUG=1: per-blade flat hue (blade 0 red, 1 green, 2
     // blue, ...) in the normal hue slot -> a screenshot instantly shows
-    // blade boundaries / vertex stepping
+    // blade boundaries / vertex stepping.
+    // Hue law (normal path): per-blade jitter + per-clump khaki jitter +
+    // a faint dry-tip tinge of exactly 0.03 * v^3. The palette anchors
+    // YELLOW at hue 0.12..0.16 (see species dry shift) BELOW green
+    // 0.24..0.40, so the tinge runs toward-yellow (minus sign).
     let dbg = gwin.spare2.y > 0.5;
-    o.frag = vec4(v, select(in.hue + jhue + 0.02 * v, f32(bid) * 0.14285715, dbg), in.dim, in.wet);
+    let hue_out = in.hue + jhue + jhue_clump - 0.03 * v * v * v;
+    o.frag = vec4(v, select(hue_out, f32(bid) * 0.14285715, dbg), in.dim, in.wet);
     o.side = vec3(side.x, 0.0, side.y);
     o.biome = in.biome;
+    o.tint = vec2(jsat, 0.0);
     // shimmer = flutter * gust * 0.12; ao = radial fallback darkening
     o.shim = vec2(flut * gust_a * 0.12, 1.0 - 0.18 * (1.0 - rk));
     return o;
@@ -788,6 +799,7 @@ struct FsIn {
     @location(2) side: vec3<f32>,
     @location(3) biome: f32,
     @location(4) shim: vec2<f32>,   // (wind-light shimmer flutter, radial AO)
+    @location(5) tint: vec2<f32>,   // per-clump hue-jitter/sat offsets (seed hash)
 }
 
 @group(0) @binding(0) var<uniform> cam: CamBlock;
@@ -847,15 +859,19 @@ fn fs(in: FsIn) -> @location(0) vec4<f32> {
     let hl = 0.5 + 0.5 * dot(n_sel, sun);
     let lit = 0.45 + 0.55 * hl;
     let tl = max(0.0, -dot(n_sel, sun));
-    let sat = 0.30 + 0.06 * (1.0 - in.biome / 6.0);
+    // biome sat law + per-clump saturation/khaki variation from the seed
+    // hash (VS folds +-0.02 into tint.x)
+    let sat = clamp(0.30 + 0.06 * (1.0 - in.biome / 6.0) + in.tint.x, 0.10, 0.85);
     // base-to-tip value ramp: dark roots, bright sunlit tips
     let val = mix(0.34, 0.88, pow(v, 0.75));
     var c = hsv(hue, sat, val) * lit * ao_in;
     c *= 0.55 + 0.45 * v;
     c += tl * 0.22 * v;
-    // ground-contact band: darken the lowest sliver of the blade
+    // ground-contact band: a LIGHTER root sliver (0.90) so the v<0.08 dark
+    // band blends into the terrain agent's lawn patchiness instead of
+    // reading as a dark skirt under every clump (base AO untouched)
     if (v < 0.08) {
-        c *= 0.85;
+        c *= 0.90;
     }
     // rain-wet sheen
     c = mix(c, vec3(0.16, 0.44, 0.40), wet * 0.45);

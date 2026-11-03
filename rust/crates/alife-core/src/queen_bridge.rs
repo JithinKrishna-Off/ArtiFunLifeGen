@@ -146,23 +146,38 @@ impl queen::QueenBrain for QueenBrainAdapterBridge {
 /// `build()` never re-reads the disk and cannot start failing silently.
 pub struct MaleCnsQueenBrainFactory {
     connectome: Arc<Connectome>,
+    /// Real sugar gustatory population (original MaleCNS body ids), read
+    /// once from the artifact package dir. `None` = the package's population
+    /// tables were unavailable; the adapter then binds food channels onto
+    /// structurally-defensible `cb_sensory` slices (documented honest
+    /// degradation).
+    sugar_bodies: Option<Arc<Vec<u64>>>,
 }
 
 impl MaleCnsQueenBrainFactory {
     /// Build from an already-validated connectome (see
-    /// [`register_default_factory`] for the disk-loading path).
+    /// [`register_default_factory`] for the disk-loading path). No sugar
+    /// population — food channels bind structurally, not gustatorily.
     pub fn from_connectome(connectome: Arc<Connectome>) -> Self {
-        Self { connectome }
+        Self { connectome, sugar_bodies: None }
+    }
+
+    /// [`MaleCnsQueenBrainFactory::from_connectome`] plus the sugar
+    /// population (original body ids; see
+    /// `alife_neural::malecns_bins::sugar_body_ids`).
+    pub fn from_connectome_with_sugar(connectome: Arc<Connectome>, sugar: Arc<Vec<u64>>) -> Self {
+        Self { connectome, sugar_bodies: Some(sugar) }
     }
 }
 
 impl queen::QueenBrainFactory for MaleCnsQueenBrainFactory {
     fn build(&self) -> Box<dyn queen::QueenBrain> {
-        match QueenBrainAdapter::new_from_connectome(self.connectome.clone(), 0) {
+        let sugar = self.sugar_bodies.as_ref().map(|a| a.as_slice());
+        match QueenBrainAdapter::new_from_connectome_with_sugar(self.connectome.clone(), 0, sugar) {
             Ok(a) => Box::new(QueenBrainAdapterBridge::new(a)),
             // Practically unreachable: registration pre-verified the exact
-            // same `new_from_connectome` call on this Arc. A `TooSmall` here
-            // would mean a logic regression, not a bad artifact — fail loudly.
+            // same build call on this Arc. A `TooSmall` here would mean a
+            // logic regression, not a bad artifact — fail loudly.
             Err(e) => Box::new(FailedQueenBrain(format!("connectome build failed: {e:?}"))),
         }
     }
@@ -209,8 +224,15 @@ pub fn register_default_factory(
     let dir = artifact_dir.as_ref();
     let path = dir.join(QUEEN_ARTIFACT_FILE);
     let conn = cb::load(&path).map_err(|e| format!("queen artifact load failed: {e}"))?;
-    QueenBrainAdapter::new_from_connectome(conn.clone(), 0)
+    // the population tables live alongside the artifact (the package dir);
+    // their absence is honest degradation, not a failure
+    let sugar = alife_neural::malecns_bins::sugar_body_ids(dir).map(Arc::new);
+    let sugar_ref = sugar.as_ref().map(|a| a.as_slice());
+    QueenBrainAdapter::new_from_connectome_with_sugar(conn.clone(), 0, sugar_ref)
         .map_err(|e| format!("queen artifact unusable by runtime: {e:?}"))?;
-    sim.set_queen_brain_factory(Some(Box::new(MaleCnsQueenBrainFactory::from_connectome(conn))));
+    sim.set_queen_brain_factory(Some(Box::new(match sugar {
+        Some(s) => MaleCnsQueenBrainFactory::from_connectome_with_sugar(conn, s),
+        None => MaleCnsQueenBrainFactory::from_connectome(conn),
+    })));
     Ok(())
 }

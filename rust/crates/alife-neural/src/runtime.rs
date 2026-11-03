@@ -66,14 +66,20 @@ pub struct TickBudget {
 
 impl Default for TickBudget {
     fn default() -> Self {
-        // Sized so one tick stays in the LOW-millisecond range even on the
-        // largest Queen subnetwork (40k neurons / ~6M synapses): ~65k
-        // scattered CSR relaxations cost a few ms on the reference machine.
-        // Work past the cap is RECORDED as dropped_synops (deterministic),
-        // never silently absorbed.
+        // Sized for one tick to stay in the low-millisecond range on the
+        // 40k-neuron queen subnetwork — AND to fit that network's measured
+        // steady demand: at the queen's calibrated operating point (three-hop
+        // afferent binding, weight_scale 0.45) the warm network self-runs at
+        // ~640 spikes/tick with ~330k synapse events/tick. Measured with the
+        // probe sweep (cap → dropped_synops per 500 warm ticks):
+        // 65_536 → ~91k (= ~180 drops/tick, decode corrupted by systematic
+        // truncation), 262_144 → ~9/tick, 400_000 → 0. The default is the
+        // measured vertex where truncation stops being systematic; caps below
+        // this are available for latency-critical callers, which then get the
+        // drop counters rather than silent absorption.
         Self {
             max_spikes: 4096,
-            max_synops: 65_536,
+            max_synops: 400_000,
         }
     }
 }
@@ -198,6 +204,27 @@ pub struct FlyBrainRuntime {
     pub motor: MotorConfig,
     pub encoders: Vec<Encoder>,
     pub polarity_policy: UnknownPolarityPolicy,
+    /// Global synapse-event current scale (RUNTIME calibration knob, not
+    /// engine state; documented modeling decision). Raw MaleCNS weights are
+    /// signed synaptic COUNTS, not conductances; on dense anatomical graphs
+    /// they applied as mV per spike event drive the LIF into saturation and
+    /// inhibit the network into permanent runaway (measured: mean membrane
+    /// diverging to -300 mV, sustained >fire cap). A scale < 1 converts raw
+    /// counts into a stable event-current unit. The synthetic fixture keeps
+    /// 1.0. Measured-selectable like the queen's channel gains; persists
+    /// across snapshots (configuration, not simulation state).
+    pub weight_scale: f32,
+    /// Per-event synapse-current saturation bound (|I_event|, mV-equivalent;
+    /// runtime calibration constant, documented modeling decision). Raw
+    /// signed-count weights inject the SAME magnitude into every event; the
+    /// strongest MaleCNS synapses (|w| up to 712) overshoot a single LIF
+    /// membrane step by tens of the threshold gap and drive the network's
+    /// inhibitory runaway. Clamping the event current models synaptic
+    /// saturation (a synapse cannot inject beyond its maximum conductance
+    /// window) and bounds the membrane trajectory deterministically. Default
+    /// leaves typical fixture weights untouched. Persists across snapshots
+    /// (configuration, not simulation state).
+    pub event_current_clamp: f32,
     provenance: Option<ProvenanceRecord>,
     brain: BrainState,
     last_stats: Stats,
@@ -264,6 +291,8 @@ impl FlyBrainRuntime {
             motor: MotorConfig::default(),
             encoders,
             polarity_policy: UnknownPolarityPolicy::default(),
+            weight_scale: 1.0,
+            event_current_clamp: 40.0,
             provenance: None,
             brain: BrainState::new(n, ring_len, v_rest),
             last_stats: Stats::default(),
@@ -532,7 +561,10 @@ impl FlyBrainRuntime {
                     break 'rows;
                 }
                 let post = self.connectome.col_idx[i];
-                let w = self.effective_weight(i, s);
+                let mut w = self.effective_weight(i, s);
+                if w.abs() > self.event_current_clamp {
+                    w = w.signum() * self.event_current_clamp;
+                }
                 if w != 0.0 {
                     synops += 1;
                     let d = self.connectome.delay_at(i, self.lif.default_delay_steps);
@@ -610,13 +642,13 @@ impl FlyBrainRuntime {
     pub fn effective_weight(&self, i: usize, pre: u32) -> f32 {
         let w = self.connectome.weights[i];
         match self.connectome.polarity_at(i, pre) {
-            Polarity::Excitatory => w,
-            Polarity::Inhibitory => -w.abs(),
+            Polarity::Excitatory => w * self.weight_scale,
+            Polarity::Inhibitory => -w.abs() * self.weight_scale,
             Polarity::Unknown => match self.polarity_policy {
                 UnknownPolarityPolicy::Ignore => 0.0,
-                UnknownPolarityPolicy::AsExcitatory => w,
-                UnknownPolarityPolicy::AsInhibitory => -w.abs(),
-                UnknownPolarityPolicy::Scale(f) => w * f,
+                UnknownPolarityPolicy::AsExcitatory => w * self.weight_scale,
+                UnknownPolarityPolicy::AsInhibitory => -w.abs() * self.weight_scale,
+                UnknownPolarityPolicy::Scale(f) => w * f * self.weight_scale,
             },
         }
     }

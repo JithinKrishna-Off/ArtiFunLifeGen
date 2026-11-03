@@ -210,11 +210,16 @@ fn finish_decode(cfg: &mut MotorConfig, rates: &[f32], dt_ms: f32) -> MotorOutpu
     }
     let alpha = (dt_ms / cfg.ema_tau_ms.max(1e-6)).clamp(0.0, 1.0);
     for (i, &r) in rates.iter().take(k).enumerate() {
-        // signed body DOFs are the fixed slots DirX(0), DirY(1), Turn(3):
-        // full silence carries the tonic baseline (same semantics as the
-        // single-cell window decode); otherwise the rate is the real signal
+        // Signed body DOFs (DirX(0), DirY(1), Turn(3)) carry the tonic
+        // baseline home when a slot has nothing to read this tick — but ONLY
+        // in the UNCALIBRATED (legacy contiguous/motor-cell) path, where
+        // r == 0.0 historically meant "slot not bound". With measured
+        // calibration installed, zero rate is the slot's real reading and
+        // must EMA down toward it; otherwise a silent driven pool would
+        // leave the EMA pinned at rate_mid_hz and poison the
+        // baseline-subtracted (ema - base)/range decode.
         let signed = matches!(i, 0 | 1 | 3);
-        let target = if signed && r == 0.0 {
+        let target = if signed && r == 0.0 && cfg.calib_baseline.is_none() {
             cfg.rate_mid_hz
         } else {
             r

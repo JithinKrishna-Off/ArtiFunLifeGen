@@ -16,6 +16,25 @@
 //! - Group 0 binds a morph-owned copy of the same `CamUniform` block used
 //!   by terrain/grass; animation time rides in `.world_wh_time_flash.z` and
 //!   lightning flash in `.w`, so there is no extra uniform.
+//!
+//! DRAW STRUCTURE (A2 organism archetype pass):
+//! - The `decomp::Planner` still runs every frame UNCHANGED (locomotion
+//!   agent owns it): its QUEEN rows are the only planner instances drawn
+//!   (queen template + reserved states are byte-identical to before); the
+//!   planner's legacy organism rows (tail/shell/billboard) remain CPU-side
+//!   planner diagnostics and are NOT drawn anymore.
+//! - Ordinary organisms are planned in [`OrganismPass`]: rows are GROUPED by
+//!   archetype key (mirroring `creature_mesh::archetype_key` quantization);
+//!   each group = one static shared mesh (`&'static [TVert]`, LRU-cached)
+//!   + one contiguous instance-buffer slice = one draw call. Groups ≤
+//!   `DETAILED_CAP` rows, blob group (QUAD billboard template) ≤ 240.
+//! - LOD: d < [`NEAR_RING`] and d < [`MID_RING`] draw the full archetype
+//!   mesh (tier already solved at build, ≤ 240 verts — A1 keeps ONE mesh
+//!   per archetype); beyond `MID_RING` to `quad_radius` organisms render as
+//!   the cheap shared billboard blob (hue via instance channel); beyond
+//!   that they are culled. Crowd overflow spills to the blob route.
+//! - Queen + selection-marker passes are structurally untouched: queen rows
+//!   still come from the planner buffer; `draw_markers` unchanged.
 
 #[path = "morph_templates.rs"]
 pub mod templates;
@@ -28,8 +47,10 @@ pub mod queen;
 mod tests;
 
 use alife_common::{Organism, Traits};
-use crate::scene::{CameraMode, Frame3D};
+use crate::creature_mesh as cmet;
+use crate::scene::{CameraMode, Frame3D, OrgInst};
 use decomp::{INST_CAP, INST_STRIDE, MODE_FOLLOW, MODE_ORBIT, MODE_PLANET};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use templates::TVert;
 use wgpu::util::DeviceExt;
@@ -126,6 +147,512 @@ pub fn morpho_param(t: &Traits) -> MorphoParam {
     }
 }
 
+// ============================================================ A2: organism
+// Organism archetype-rendering pass (pure CPU planning here; GPU buffer
+// management lives in `Morph`). The decomp planner is untouched; queen rows
+// keep flowing through it. Everything below draws ORDINARY organisms from
+// A1's archetype meshes (creature_mesh.rs).
+
+/// LOD: nearer than this counts as "near" (diag lane 1).
+pub const NEAR_RING: f32 = 60.0;
+/// LOD: detail ring — full archetype meshes only inside this radius (world
+/// units); beyond it creatures render as the shared billboard blob.
+pub const MID_RING: f32 = 180.0;
+/// Hard per-frame slots for full archetype-mesh instances (nearest admitted
+/// first; crowd overflow spills to the blob route). One instance = one whole
+/// creature mesh.
+pub const DETAILED_CAP: usize = 128;
+/// Far blob slots: mirrors the legacy `decomp::QUAD_CAP`.
+pub const BLOB_CAP: usize = decomp::QUAD_CAP as usize;
+
+/// Planner-side fallback archetype key: bit 62 so it can never collide with
+/// creature_mesh's real-archetype space (bit 63-free) or its brand-fallback
+/// keys (bit 63 set). Used when the lead has not wired per-row descriptors.
+#[inline]
+pub fn organism_fallback_key(brand: u32) -> u64 {
+    0x4000_0000_0000_0000 | (brand as u64 & 0x3)
+}
+
+/// Mesh-space ground footprint (local BL units, as authored by creature_mesh;
+/// verts scale by the instance radius).
+#[derive(Clone, Copy)]
+pub(crate) struct Footprint {
+    pub min_y: f32,
+    pub max_y: f32,
+}
+
+/// Deterministic scan of a baked mesh: lowest + highest vertex Y.
+pub(crate) fn mesh_footprint(mesh: &[TVert]) -> Footprint {
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for v in mesh {
+        lo = lo.min(v.pos[1]);
+        hi = hi.max(v.pos[1]);
+    }
+    if !lo.is_finite() {
+        lo = -1.0;
+    }
+    if !hi.is_finite() {
+        hi = 1.0;
+    }
+    Footprint { min_y: lo, max_y: hi }
+}
+
+/// Mesh y-hull as world units at the given instance radius.
+#[inline]
+pub(crate) fn footprint_radius(fp: &Footprint, r: f32) -> f32 {
+    ((fp.max_y - fp.min_y) * r * 0.5).max(0.02)
+}
+
+/// `hue`-derived animation phase (same walk as the decomp convention).
+#[inline]
+fn inst_phase(hue: f32) -> f32 {
+    hue.rem_euclid(1.0) * std::f32::consts::TAU * 7.0
+}
+
+/// Animation-rate multiplier per brand (decomp convention), clamped to the
+/// queen-safe gait band so archetype body breathing stays calm: the shared
+/// 6.x VS branch multiplies breathing by `wave`, so flagellate-class tails
+/// ride the same instance and must not quiver the trunk.
+#[inline]
+fn wave_rate_clamped(brand: u32, turgor01: f32) -> f32 {
+    let raw = match brand {
+        1 => 5.2 + 4.8 * turgor01,  // flagellate beat
+        3 => 0.9 + 0.7 * turgor01,  // filament wobble
+        2 => 1.3 + 0.5 * turgor01,  // colony idle
+        _ => 1.6 + 0.6 * turgor01,  // plain cell
+    };
+    raw.clamp(1.0, 3.6)
+}
+
+/// Morphology cache: signature -> (archetype key, leaked-static mesh).
+///
+/// Strategy per the integration contract: geometry is shared per
+/// `archetype_key` (creature_mesh LRU, ≤ 72 leaks), while the per-organism
+/// `CreatureMorph` re-derivation is what the cache avoids on warm frames.
+/// Without descriptors the plan derives nothing at all (brand fallbacks only),
+/// and rows still resolve through the cache; with the lead's row-archetype
+/// hook (`Morph::set_row_archetypes`) the cache refreshes an entry whenever a
+/// hooked key differs (e.g. a genome-hash dress field drifted -> new
+/// archetype), so an identical organism never rebuilds on the warm path.
+/// Slices are leaked-static (creature_mesh graveyard guarantees validity),
+/// so eviction can never dangle; entries are discarded wholesale at the LRU
+/// cap (4096) like the decomp decomposition cache.
+pub struct MorphCache {
+    map: HashMap<u64, (u64, &'static [TVert])>,
+    lru: VecDeque<u64>,
+    /// cache misses (rebuilds) during the last `OrganismPass::plan`
+    pub last_pass_rebuilds: usize,
+}
+
+const MORPH_CACHE_CAP: usize = 4096;
+
+impl MorphCache {
+    fn new() -> MorphCache {
+        MorphCache {
+            map: HashMap::new(),
+            lru: VecDeque::new(),
+            last_pass_rebuilds: 0,
+        }
+    }
+
+    /// Warm path: refresh LRU and return the cached entry; rebuild only on a
+    /// miss (or when a per-row hook key disagrees with the cached one).
+    fn resolve(
+        &mut self,
+        sig: u64,
+        want: Option<u64>,
+        make: impl FnOnce() -> (u64, &'static [TVert]),
+    ) -> (u64, &'static [TVert]) {
+        if let Some(&(k, m)) = self.map.get(&sig) {
+            if want.map_or(true, |w| w == k) {
+                if let Some(pos) = self.lru.iter().position(|&s| s == sig) {
+                    self.lru.remove(pos);
+                    self.lru.push_back(sig);
+                }
+                return (k, m);
+            }
+        }
+        if self.map.len() >= MORPH_CACHE_CAP {
+            self.map.clear();
+            self.lru.clear();
+        }
+        let entry = make();
+        self.map.insert(sig, entry);
+        self.lru.push_back(sig);
+        self.last_pass_rebuilds += 1;
+        entry
+    }
+}
+
+/// One pass' organism render plan: archetype-grouped detailed rows + far
+/// blob rows, all in the exact `decomp::MorphInst` layout (the WGSL instance
+/// attributes are unchanged in shape — 22 x f32, locations 2..=21; the A3
+/// locomotion fields ride locations 14..=21 and stay zero on non-creature
+/// lanes so the queen template and blob paths decode identically).
+pub struct OrgPlan {
+    /// detailed rows, uniform within each `groups` range
+    pub arch: Vec<decomp::MorphInst>,
+    /// (archetype key, first row index, row count); keys ascending
+    pub groups: Vec<(u64, u32, u32)>,
+    /// far blob rows (QUAD billboard template), farthest-first
+    pub blobs: Vec<decomp::MorphInst>,
+}
+
+impl OrgPlan {
+    fn new() -> OrgPlan {
+        OrgPlan {
+            arch: Vec::with_capacity(DETAILED_CAP),
+            groups: Vec::new(),
+            blobs: Vec::with_capacity(BLOB_CAP),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.arch.clear();
+        self.groups.clear();
+        self.blobs.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.arch.is_empty() && self.blobs.is_empty()
+    }
+}
+
+/// Pure-CPU organism scheduler (no device state; tests drive it directly).
+/// Scratch buffers are pre-allocated in `new` and reused every frame.
+pub struct OrganismPass {
+    det_scr: Vec<(f32, u32)>,
+    far_scr: Vec<(f32, u32)>,
+    rows_scr: Vec<(u64, decomp::MorphInst)>,
+    spill_scr: Vec<(f32, u32)>,
+    cache: MorphCache,
+    /// A3: per-organism (sim id) locomotion state — stride phase + gait
+    /// speed from cached position deltas (visual only). Prunes dead ids
+    /// (by generation stamp) at the end of every `plan`.
+    loco: decomp::LocoTracks,
+    /// archetype key -> mesh (distinct keys this session; diag lane 2)
+    key_mesh: HashMap<u64, &'static [TVert]>,
+    /// (near, mid, far) counts of the last pass
+    lod: (u32, u32, u32),
+    /// skipped rows (dead/queen/culled/over-cap) last pass
+    skipped: u32,
+}
+
+impl OrganismPass {
+    pub fn new() -> OrganismPass {
+        OrganismPass {
+            det_scr: Vec::with_capacity(1600),
+            far_scr: Vec::with_capacity(1600),
+            rows_scr: Vec::with_capacity(DETAILED_CAP),
+            spill_scr: Vec::with_capacity(1600),
+            cache: MorphCache::new(),
+            loco: decomp::LocoTracks::new(),
+            key_mesh: HashMap::new(),
+            lod: (0, 0, 0),
+            skipped: 0,
+        }
+    }
+
+    /// A3: engine frame dt (seconds) for the locomotion gait-speed
+    /// estimator (position delta / dt). Visual only, mirrors the planner's
+    /// queen estimator. NaN/negative dt is ignored.
+    pub fn set_frame_dt(&mut self, dt: f32) {
+        self.loco.set_frame_dt(dt);
+    }
+
+    /// (live cache entries, distinct archetype meshes, rebuilds last pass)
+    pub fn diag(&self) -> (usize, usize, usize) {
+        (self.cache.map.len(), self.key_mesh.len(), self.cache.last_pass_rebuilds)
+    }
+
+    /// (near, mid, far) instance counts of the last pass.
+    pub fn lod_counts(&self) -> (u32, u32, u32) {
+        self.lod
+    }
+
+    /// Skipped-row count of the last pass (diag).
+    pub fn skipped_count(&self) -> u32 {
+        self.skipped
+    }
+
+    /// Mesh slice for an archetype key this session (GPU-buffer build path).
+    pub(crate) fn mesh_of(&self, key: u64) -> Option<&'static [TVert]> {
+        self.key_mesh.get(&key).copied()
+    }
+
+    /// Resolve the (key, mesh, canonical descriptor) for one row. `hook`
+    /// delivers the lead's per-row real `archetype_key` when wired;
+    /// otherwise the brand fallback route applies (A1
+    /// `organism_brand_fallback` + `fallback_morph(brand)` shape). The
+    /// canonical descriptor is the shared-mesh-canonical anatomy: the A3
+    /// locomotion model reads body_plan / jointedness / armour from it so
+    /// gait style follows exactly the mesh that is drawn.
+    fn resolve(
+        &mut self,
+        o: &OrgInst,
+        hook: Option<u64>,
+    ) -> (u64, &'static [TVert], alife_common::morphology::CreatureMorph) {
+        let sig = decomp::signature(o);
+        let brand = o.brand & 0x3;
+        match hook {
+            Some(hkey) => {
+                // Real descriptor route: the hook key IS the archetype key; the
+                // mesh registry is LRU-cached + leak-static, `ensure_mesh`
+                // builds on the first miss only. Cache entry refresh keeps the
+                // warm path free of registry traffic when the key is stable.
+                let (key, mesh) = self.cache.resolve(sig, Some(hkey), || {
+                    (hkey, cmet::ensure_mesh(hkey))
+                });
+                let canon = cmet::canonical_from_key(key);
+                self.key_mesh.insert(key, mesh);
+                (key, mesh, canon)
+            }
+            None => {
+                // Brand fallback route: generic archetype mesh per plan
+                // (BodyPlan discriminant == brand), used when no sim-derived
+                // CreatureMorph is available (the frame snapshot carries no
+                // genotype). Shape constants come from the documented
+                // generic descriptors (~1.39 world units at nominal turgor).
+                let fkey = organism_fallback_key(brand);
+                let (key, mesh) = self.cache.resolve(sig, None, || {
+                    (fkey, crate::morph::templates::organism_brand_fallback(brand))
+                });
+                let fm = cmet::fallback_morph(brand);
+                self.key_mesh.insert(key, mesh);
+                (key, mesh, fm)
+            }
+        }
+    }
+
+    /// Build one detailed row: organism pose + A1 scale recipe + A3 body
+    /// motion (locomotion is view-side only; the sim row is authoritative).
+    fn build_row(
+        &mut self,
+        o: &OrgInst,
+        hook: Option<u64>,
+        height_at: &mut dyn FnMut(f32, f32) -> f32,
+        visible: &mut dyn FnMut([f32; 3], f32) -> bool,
+    ) -> bool {
+        let (key, mesh, m) = self.resolve(o, hook);
+        let e = o.energy.clamp(0.0, 1.0);
+        let size = o.size.clamp(0.3, 2.0);
+        let tf = 0.62 + 0.38 * e; // existing energy/size modulation chain
+        // A1 recipe: instance radius = RENDER_SCALE * body_length, with the
+        // legacy size/turgor modulation kept on top of the nominal scale.
+        let r = (cmet::RENDER_SCALE * m.body_length * size * tf).max(0.05);
+        let fp = mesh_footprint(mesh);
+        // seat the mesh's lowest vertex on the terrain (heading-rotation
+        // invariants: yaw only, so the hull lift is heading-independent)
+        let gy = height_at(o.x, o.y);
+        let base_y = gy - fp.min_y * r;
+        if !visible([o.x, base_y, o.y], footprint_radius(&fp, r)) {
+            return false;
+        }
+        // A3: per-organism (sim id) stride phase + gait speed from the
+        // cached position delta, then the pure body-motion model. The
+        // visible body length is the instance radius (BL world extent).
+        let (trk_phase, speed) = self.loco.advance(o.id, o.x, o.y);
+        let phase = trk_phase + inst_phase(o.hue) + o.x * 0.031 + o.y * 0.017;
+        let mo = decomp::motion_for(
+            m.body_plan as u8,
+            r,
+            speed,
+            phase,
+            m.jointedness,
+            m.armour,
+        );
+        self.rows_scr.push((
+            key,
+            decomp::MorphInst {
+                pos_x: o.x,
+                pos_y: base_y,
+                pos_z: o.y,
+                // yaw sway rides the row's own heading float (view-only)
+                heading: o.heading + mo.sway,
+                radius: r,
+                breathe: 0.05 + 0.08 * (1.0 - e),
+                hue: o.hue.rem_euclid(1.0),
+                age: o.age.clamp(0.0, 1.0),
+                alpha: o.alive.clamp(0.0, 1.0),
+                flags: 0.0,
+                phase: inst_phase(o.hue),
+                turgor: 0.35 + 0.65 * e,
+                wave: wave_rate_clamped(o.brand, e),
+                // sat_tint rides the pad channel (0.15..0.45, strictly inside
+                // (0, 0.5) so queen rows pad∈{0,1} can never be tinted)
+                pad: m.sat_tint.clamp(0.0, 0.49),
+                // A3 locomotion block
+                motion: [mo.bob, mo.pitch, mo.roll, mo.phase],
+                drive: [mo.leg_amp, mo.leg_lift, mo.squash, mo.breathe],
+            },
+        ));
+        true
+    }
+
+    /// One legacy blob (billboard) row: byte-identical conventions to the
+    /// planner's billboard pass (radius chain, distance fade), only the fade
+    /// window starts at [`MID_RING`].
+    fn build_blob(
+        &mut self,
+        o: &OrgInst,
+        d: f32,
+        mode: u8,
+        out: &mut OrgPlan,
+        height_at: &mut dyn FnMut(f32, f32) -> f32,
+        visible: &mut dyn FnMut([f32; 3], f32) -> bool,
+    ) -> bool {
+        let e = o.energy.clamp(0.0, 1.0);
+        let size = o.size.clamp(0.3, 2.0);
+        let radius = decomp::ORGANISM_UNIT_RADIUS * size * (0.62 + 0.38 * e);
+        let qr = decomp::quad_radius(mode);
+        let fade = (1.0 - (d - MID_RING) / (qr - MID_RING)).clamp(0.0, 1.0);
+        let gy = height_at(o.x, o.y);
+        let center = [o.x, gy + radius * 0.62, o.y];
+        if !visible(center, radius) {
+            return false;
+        }
+        out.blobs.push(decomp::MorphInst {
+            pos_x: center[0],
+            pos_y: center[1],
+            pos_z: center[2],
+            heading: o.heading,
+            radius,
+            breathe: 0.0,
+            hue: o.hue.rem_euclid(1.0),
+            age: o.age.clamp(0.0, 1.0),
+            alpha: o.alive.clamp(0.0, 1.0) * fade,
+            flags: 0.0,
+            phase: inst_phase(o.hue),
+            turgor: 0.35 + 0.65 * e,
+            wave: 0.0,
+            pad: 0.0,
+            // far blobs never animate (pad 0 -> the VS motion gate is off)
+            motion: [0.0; 4],
+            drive: [0.0; 4],
+        });
+        true
+    }
+
+    /// Pure-CPU organism scheduling. `row_keys`: optional lead hook, parallel
+    /// to `orgs` (real `archetype_key(derive(org))` per row; `None` = brand
+    /// fallbacks). `height_at`/`visible` mirror the decomp planner contract.
+    /// Rows land in `out` (scratch-only borrow; the coordinator passes the
+    /// mutex-guarded plan slot, tests pass a local).
+    pub fn plan(
+        &mut self,
+        orgs: &[OrgInst],
+        row_keys: Option<&[u64]>,
+        view: [f32; 3],
+        mode: u8,
+        out: &mut OrgPlan,
+        height_at: &mut dyn FnMut(f32, f32) -> f32,
+        visible: &mut dyn FnMut([f32; 3], f32) -> bool,
+    ) {
+        self.cache.last_pass_rebuilds = 0;
+        self.skipped = 0;
+        self.det_scr.clear();
+        self.far_scr.clear();
+        self.rows_scr.clear();
+        self.loco.begin_pass(); // pass stamp for the end-of-plan dead-id prune
+        out.clear();
+        let qr = decomp::quad_radius(mode);
+        let mid2 = MID_RING * MID_RING;
+        let qr2 = qr * qr;
+        for (i, o) in orgs.iter().take(decomp::MAX_ORGS_SCAN).enumerate() {
+            if o.alive <= 0.0 || o.is_queen != 0 || o.brand == crate::morph::BRAND_QUEEN {
+                self.skipped += (o.alive > 0.0 && (o.is_queen != 0 || o.brand == crate::morph::BRAND_QUEEN)) as u32;
+                continue; // queens render via the planner's reserved pass
+            }
+            let dx = o.x - view[0];
+            let dz = o.y - view[2];
+            let d2 = dx * dx + dz * dz;
+            if !d2.is_finite() {
+                self.skipped += 1;
+                continue;
+            }
+            if d2 < mid2 {
+                self.det_scr.push((d2, i as u32));
+            } else if d2 < qr2 {
+                self.far_scr.push((d2, i as u32));
+            } else {
+                self.skipped += 1;
+            }
+        }
+        let cmp = |a: &(f32, u32), b: &(f32, u32)| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        self.det_scr.sort_by(cmp);
+        // farthest-first blob candidates (back-to-front alpha blend)
+        self.far_scr.sort_by(|a, b| cmp(b, a));
+
+        // ---- detailed rows, nearest-first, capped; crowd overflow spills to
+        // the blob route (shared with the far pool, sorted desc below)
+        let (mut near, mut mid) = (0u32, 0u32);
+        self.spill_scr.clear();
+        for k in 0..self.det_scr.len() {
+            let (d2, i) = self.det_scr[k];
+            if self.rows_scr.len() >= DETAILED_CAP {
+                self.spill_scr.push((d2, i));
+                continue;
+            }
+            let hook = row_keys.and_then(|k| k.get(i as usize).copied());
+            if self.build_row(&orgs[i as usize], hook, height_at, visible) {
+                if d2.sqrt() < NEAR_RING {
+                    near += 1;
+                } else {
+                    mid += 1;
+                }
+            } else {
+                self.skipped += 1;
+            }
+        }
+
+        // ---- far blobs + detail-crowd spill, farthest-first
+        for k in 0..self.far_scr.len() {
+            let (d2, i) = self.far_scr[k];
+            if out.blobs.len() >= BLOB_CAP {
+                self.skipped += 1;
+                continue;
+            }
+            if !self.build_blob(&orgs[i as usize], d2.sqrt(), mode, out, height_at, visible) {
+                self.skipped += 1;
+            }
+        }
+        self.spill_scr.sort_by(|a, b| cmp(b, a));
+        for k in 0..self.spill_scr.len() {
+            let (d2, i) = self.spill_scr[k];
+            if out.blobs.len() >= BLOB_CAP {
+                self.skipped += 1;
+                continue;
+            }
+            if !self.build_blob(&orgs[i as usize], d2.sqrt(), mode, out, height_at, visible) {
+                self.skipped += 1;
+            }
+        }
+
+        // ---- group by archetype key (contiguous, key-ascending for a
+        // deterministic, cache-friendly draw order)
+        self.rows_scr.sort_by_key(|(k, _)| *k);
+        let mut gi = 0usize;
+        while gi < self.rows_scr.len() {
+            let key = self.rows_scr[gi].0;
+            let mut gj = gi;
+            while gj < self.rows_scr.len() && self.rows_scr[gj].0 == key {
+                gj += 1;
+            }
+            let first = out.arch.len() as u32;
+            for (_, row) in &self.rows_scr[gi..gj] {
+                out.arch.push(*row);
+            }
+            out.groups.push((key, first, (gj - gi) as u32));
+            gi = gj;
+        }
+        self.lod = (near, mid, out.blobs.len() as u32);
+        debug_assert!((out.arch.len() + out.blobs.len()) <= DETAILED_CAP + BLOB_CAP);
+        self.loco.prune(); // drop tracks of ids that never advanced this pass
+    }
+}
+
 fn mode_of(m: &CameraMode) -> u8 {
     match m {
         CameraMode::Follow { .. } => MODE_FOLLOW,
@@ -138,6 +665,13 @@ struct Gpu {
     pipeline: wgpu::RenderPipeline,
 }
 
+/// Lazily created GPU vertex buffer for one archetype mesh (stable `&'static`
+/// mesh slice -> one buffer, built once on the group's first draw).
+struct ArchBuf {
+    buf: wgpu::Buffer,
+    vcount: u32,
+}
+
 /// Everything the organism pass needs; buffers are allocated exactly once
 pub struct Morph {
     gpu: Option<Gpu>,
@@ -148,6 +682,18 @@ pub struct Morph {
     cam_bg: wgpu::BindGroup,
     /// per-frame planner; on the happy path this never touches the heap
     planner: Option<Mutex<decomp::Planner>>,
+    /// A2: archetype vertex buffers, keyed by archetype key (created in
+    /// update_gpu where the device is reachable; draw only reads).
+    arch_bufs: HashMap<u64, ArchBuf>,
+    /// A2: instance buffer for archetype-group rows + blob rows
+    org_inst_buf: wgpu::Buffer,
+    /// A2: last organism plan (locked hand-off from update_gpu to draw_with)
+    org_plan: Mutex<OrgPlan>,
+    /// A2 lead-integration hook: optional per-row archetype keys parallel to
+    /// `Frame3D.orgs`, consumed by the next `update_gpu` (then cleared).
+    row_keys: Mutex<Option<Vec<u64>>>,
+    /// A2: pure-CPU organism scheduler (scratch + MorphCache + LOD counts)
+    organisms: OrganismPass,
     /// selection/hover marker overlay (one extra instanced draw, <= 3
     /// instances); lazily pipelined with `ensure_pipeline`
     pub markers: crate::scene::markers::MarkerRig,
@@ -190,6 +736,13 @@ impl Morph {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // A2: archetype-group rows [+ blob rows] instance ring
+        let org_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view3d.morph.org.insts"),
+            size: ((DETAILED_CAP + BLOB_CAP) * INST_STRIDE) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let cam_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("view3d.morph.cam"),
             size: std::mem::size_of::<crate::scene::CamUniform>() as u64,
@@ -211,6 +764,11 @@ impl Morph {
             cam_buf,
             cam_bg,
             planner: Some(Mutex::new(decomp::Planner::new())),
+            arch_bufs: HashMap::new(),
+            org_inst_buf,
+            org_plan: Mutex::new(OrgPlan::new()),
+            row_keys: Mutex::new(None),
+            organisms: OrganismPass::new(),
             markers: crate::scene::markers::MarkerRig::new(),
         })
     }
@@ -260,7 +818,11 @@ impl Morph {
                 format: if i == 0 { wgpu::VertexFormat::Float32x4 } else { wgpu::VertexFormat::Float32x2 },
             })
             .collect();
-        // 13 floats: pos(3) then 10 scalar instance attributes (locs 3..13)
+        // Exactly 16 instance attributes (wgpu's default max_vertex_attributes
+        // limit): pos(3) @2, 11 scalars @3..=13, then the A3 locomotion
+        // pair packed as two vec4s: `motion` @14 (offset 56) and `drive`
+        // @15 (offset 72). Never-animated lanes keep those bytes at zero so
+        // the queen path is untouched.
         let mut i_attrs = vec![wgpu::VertexAttribute {
             offset: 0,
             shader_location: 2,
@@ -273,6 +835,16 @@ impl Morph {
                 format: wgpu::VertexFormat::Float32,
             });
         }
+        i_attrs.push(wgpu::VertexAttribute {
+            offset: 56,
+            shader_location: 14,
+            format: wgpu::VertexFormat::Float32x4,
+        });
+        i_attrs.push(wgpu::VertexAttribute {
+            offset: 72,
+            shader_location: 15,
+            format: wgpu::VertexFormat::Float32x4,
+        });
         let pipeline = device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("view3d.morph.pline"),
@@ -339,6 +911,11 @@ impl Morph {
     }
 
     /// TEMP diag: current plan bucket counts.
+    ///
+    /// NOTE (A2): since the organism archetype pass took over ordinary
+    /// creature rendering, the tail/shell/billboard lanes are PLANNER-INTERNAL
+    /// diagnostics only (the live draw consumes the queen lane from this
+    /// buffer). Use [`diag_lod`] + [`diag_morph_cache`] for the live path.
     pub fn diag_plan(&self) -> (u32, u32, u32, u32) {
         match self.planner.as_ref() {
             Some(p) => {
@@ -348,6 +925,34 @@ impl Morph {
             }
             None => (0, 0, 0, 0),
         }
+    }
+
+    /// A2 diag: (live MorphCache entries, distinct archetype meshes in use,
+    /// cache rebuilds during the last pass).
+    pub fn diag_morph_cache(&self) -> (usize, usize, usize) {
+        self.organisms.diag()
+    }
+
+    /// A2 diag: (near, mid, far) instance counts of the last organism pass.
+    pub fn diag_lod(&self) -> (u32, u32, u32) {
+        self.organisms.lod_counts()
+    }
+
+    /// A2 diag: rows skipped by the last organism pass
+    /// (dead rows do not count; queens routing to the planner do).
+    pub fn diag_skipped(&self) -> u32 {
+        self.organisms.skipped_count()
+    }
+
+    /// A2 lead-integration hook: optional per-row archetype keys parallel to
+    /// `Frame3D.orgs` (`creature_mesh::archetype_key(&morphology::derive(org))`
+    /// computed at the UI build site, where the real organisms are in scope).
+    /// The vector is consumed by the NEXT `update_gpu` (then cleared), so it
+    /// must be re-armed every frame it applies. With the hook armed, rows
+    /// render true per-genome archetype meshes; without it they render the
+    /// brand fallback archetypes (same BodyPlan mapping, generic shape).
+    pub fn set_row_archetypes(&mut self, keys: Option<Vec<u64>>) {
+        *self.row_keys.lock().unwrap_or_else(|e| e.into_inner()) = keys;
     }
 
     /// QUEEN-only: this frame's queen trample footprint from the planner as
@@ -363,7 +968,14 @@ impl Morph {
 
     /// Per-frame planning + uploads; the coordinator calls this in
     /// `View3D::update` right before/after grass's `update_gpu`.
-    pub fn update_gpu(&mut self, _device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame3D) {
+    ///
+    /// Sequence: (1) the untouched decomp planner still plans queen rows
+    /// (grass trample + queen states come from it); (2) only the QUEEN rows
+    /// of its output are uploaded to the legacy instance buffer; (3) the pure
+    /// [`OrganismPass`] plans ordinary creatures into archetype-grouped rows
+    /// and far blobs; (4) group meshes get lazily-uploaded vertex buffers and
+    /// the row bytes land in `org_inst_buf` ([arch rows | blob rows]).
+    pub fn update_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame3D) {
         queue.write_buffer(&self.cam_buf, 0, bytemuck::bytes_of(&frame.cam));
         self.markers.update(queue, frame);
         let Some(planner) = self.planner.as_ref() else { return };
@@ -374,6 +986,8 @@ impl Morph {
         let mut guard = planner.lock().unwrap_or_else(|p| p.into_inner());
         // QUEEN-only: engine dt for gait-speed estimation from position delta
         guard.set_frame_dt(frame.dt);
+        // A3: ordinary creatures estimate gait speed the same way (OrganismPass)
+        self.organisms.set_frame_dt(frame.dt);
         let okay = guard.plan(
             &frame.orgs,
             view,
@@ -381,63 +995,113 @@ impl Morph {
             &mut |x: f32, y: f32| crate::terrain::terrain_height_at(&frame.world, x, y) as f32,
             &mut |c: [f32; 3], r: f32| frustum.sphere_visible(c, r),
         );
-        let bytes = bytemuck::cast_slice(&okay.insts);
-        if !bytes.is_empty() {
-            queue.write_buffer(&self.inst_buf, 0, bytes);
+        // ---- queen-only upload: slice [tail_n + shell_n .. + queen_n) so the
+        // draw path keeps reading queen rows from this buffer at offset 0
+        let (tn, sn, qun) = (okay.tail_n as usize, okay.shell_n as usize, okay.queen_n as usize);
+        if qun > 0 {
+            let all = bytemuck::cast_slice::<decomp::MorphInst, u8>(&okay.insts);
+            queue.write_buffer(&self.inst_buf, 0, &all[(tn + sn) * INST_STRIDE..(tn + sn + qun) * INST_STRIDE]);
         }
+        // ---- A2 organism archetype pass (planner untouched; separate plan).
+        // Frame-armed keys (`Frame3D.org_arch`, preferred) or the one-shot
+        // `set_row_archetypes` hook; empty/unarmed -> brand fallback meshes.
+        let hook = if !frame.org_arch.is_empty() {
+            Some(frame.org_arch.clone())
+        } else {
+            self.row_keys.lock().unwrap_or_else(|e| e.into_inner()).take()
+        };
+        let mut plan_guard = self.org_plan.lock().unwrap_or_else(|e| e.into_inner());
+        self.organisms.plan(
+            &frame.orgs,
+            hook.as_deref(),
+            view,
+            mode,
+            &mut plan_guard,
+            &mut |x: f32, y: f32| crate::terrain::terrain_height_at(&frame.world, x, y) as f32,
+            &mut |c: [f32; 3], r: f32| frustum.sphere_visible(c, r),
+        );
+        // lazily upload one vertex buffer per drawn archetype mesh
+        for &(key, _, count) in &plan_guard.groups {
+            if count == 0 || self.arch_bufs.contains_key(&key) {
+                continue;
+            }
+            if let Some(mesh) = self.organisms.mesh_of(key) {
+                let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("view3d.morph.org.arch"),
+                    contents: bytemuck::cast_slice(mesh),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                self.arch_bufs.insert(key, ArchBuf { buf, vcount: mesh.len() as u32 });
+            }
+        }
+        // rows: [arch | blobs]
+        if !plan_guard.is_empty() {
+            let arch_bytes = bytemuck::cast_slice::<decomp::MorphInst, u8>(&plan_guard.arch);
+            if !arch_bytes.is_empty() {
+                queue.write_buffer(&self.org_inst_buf, 0, arch_bytes);
+            }
+            let blob_bytes = bytemuck::cast_slice::<decomp::MorphInst, u8>(&plan_guard.blobs);
+            if !blob_bytes.is_empty() {
+                queue.write_buffer(&self.org_inst_buf, (plan_guard.arch.len() * INST_STRIDE) as u64, blob_bytes);
+            }
+        }
+        drop(plan_guard);
     }
 
-    /// Three instanced draws (tail / shell / billboard buckets). No-op until
-    /// ensure_pipeline + first successful update_gpu.
+    /// Draw: QUEEN rows from the planner buffer (template soup), then one
+    /// instanced draw per archetype group (shared static mesh + contiguous
+    /// instance slice), then the far blob group (QUAD billboard template).
+    /// alpha order: detailed creatures -> queen -> far blobs (farthest first).
+    /// No-op until ensure_pipeline + first successful update_gpu.
     pub fn draw_with<'a>(&self, pass: &mut wgpu::RenderPass<'a>, frame: Option<&crate::scene::Frame3D>) {
         let Some(gpu) = self.gpu.as_ref() else { return };
         let Some(frame) = frame else { return };
         let _ = frame;
         let Some(planner) = self.planner.as_ref() else { return };
         // NOTE: frame's visuals were already planned in update_gpu; the
-        // planner mutex hands the current plan to the paint path.
+        // planner mutex hands the queen rows to the paint path.
         let plan_guard = planner.lock().unwrap_or_else(|p| p.into_inner());
         let plan = plan_guard.current();
-        if (plan.tail_n + plan.shell_n + plan.queen_n + plan.quad_n) == 0 || plan.insts.is_empty() {
+        let org_guard = self.org_plan.lock().unwrap_or_else(|p| p.into_inner());
+        if plan.queen_n == 0 && org_guard.is_empty() {
             return;
         }
-        let (tn, sn, qun, qn) = (
-            plan.tail_n as u64,
-            plan.shell_n as u64,
-            plan.queen_n as u64,
-            plan.quad_n as u64,
-        );
         let stride = INST_STRIDE as u64;
         pass.set_pipeline(&gpu.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
+        // ---- QUEEN: reserved template (unchanged path, planner-owned data)
         pass.set_vertex_buffer(0, self.verts_buf.slice(..));
-        if tn > 0 {
-            pass.set_vertex_buffer(1, self.inst_buf.slice(0..tn * stride));
-            pass.draw(templates::TAIL_VBASE..templates::TAIL_VBASE + templates::TAIL_VCOUNT, 0..tn as u32);
-        }
-        if sn > 0 {
-            pass.set_vertex_buffer(1, self.inst_buf.slice(tn * stride..(tn + sn) * stride));
-            pass.draw(
-                templates::SHELL_VBASE..templates::SHELL_VBASE + templates::SHELL_VCOUNT,
-                0..sn as u32,
-            );
-        }
-        if qun > 0 {
-            pass.set_vertex_buffer(
-                1,
-                self.inst_buf
-                    .slice((tn + sn) * stride..(tn + sn + qun) * stride),
-            );
+        if plan.queen_n > 0 {
+            pass.set_vertex_buffer(1, self.inst_buf.slice(0..(plan.queen_n as u64) * stride));
             pass.draw(
                 templates::QUEEN_VBASE..templates::QUEEN_VBASE + templates::QUEEN_VCOUNT,
-                0..qun as u32,
+                0..plan.queen_n,
             );
         }
-        if qn > 0 {
-            pass.set_vertex_buffer(1, self.inst_buf.slice((tn + sn + qun) * stride..(tn + sn + qun + qn) * stride));
+        // ---- archetype groups: one shared mesh buffer + one instance slice
+        for &(key, first, count) in &org_guard.groups {
+            if count == 0 {
+                continue;
+            }
+            if let Some(ab) = self.arch_bufs.get(&key) {
+                pass.set_vertex_buffer(0, ab.buf.slice(..));
+                pass.set_vertex_buffer(
+                    1,
+                    self.org_inst_buf
+                        .slice((first as u64) * stride..(first as u64 + count as u64) * stride),
+                );
+                pass.draw(0..ab.vcount, 0..count);
+            }
+        }
+        // ---- far blobs: camera-facing billboard template, farthest-first
+        if !org_guard.blobs.is_empty() {
+            pass.set_vertex_buffer(0, self.verts_buf.slice(..));
+            let a = org_guard.arch.len() as u64;
+            let b = (org_guard.arch.len() + org_guard.blobs.len()) as u64;
+            pass.set_vertex_buffer(1, self.org_inst_buf.slice(a * stride..b * stride));
             pass.draw(
                 templates::QUAD_VBASE..templates::QUAD_VBASE + templates::QUAD_VCOUNT,
-                0..qn as u32,
+                0..org_guard.blobs.len() as u32,
             );
         }
     }
@@ -474,6 +1138,11 @@ struct VIn {
     @location(11) iturgor: f32,
     @location(12) iwave: f32,
     @location(13) ipad: f32,
+    // A3 locomotion extension (append-only; never-animated lanes keep 0.0):
+    // imotion = (bob_y world units, pitch rad, roll rad, stride phase rad)
+    // idrive  = (leg swing world, leg lift world, walk squash, breathe amp)
+    @location(14) imotion: vec4<f32>,
+    @location(15) idrive: vec4<f32>,
 };
 
 struct VOut {
@@ -482,6 +1151,14 @@ struct VOut {
     @location(1) nuv: vec4<f32>,       // sphere normal .xyz | tail t in .w | billboard corner .xy
     @location(2) misc: vec4<f32>,      // (turgor, age, wave, phase)
 };
+
+// A2: queen rows carry pad = 0.0/1.0 (LOD flag; queen stubs/antennae are
+// authored in world units). Ordinary archetype rows carry pad = sat_tint in
+// (0, 0.5) — the gate below switches template scaling + tinting so the
+// queen path stays visually byte-identical.
+fn creature_gate(pad: f32) -> bool {
+    return (pad > 0.001) && (pad < 0.5);
+}
 
 @vertex
 fn vs(i: VIn) -> VOut {
@@ -517,9 +1194,14 @@ fn vs(i: VIn) -> VOut {
         local = local * taper * ell * (1.0 + i.ibreathe * 0.2 * sin(t * i.iwave * 0.8 + i.iphase)) * r;
         nuv = vec4<f32>(normalize(i.tpos.xyz), nuv.w);
     } else if (id < 4.5) {
-        // flagella: vertex-shader wave along the bezier chord (param in x)
+        // flagella/tail: vertex-shader wave along the chord (param in x).
+        // A2: archetype-mesh tails are authored in body-length units and
+        // scale by the instance radius; queen/legacy rows keep the unscaled
+        // world-unit convention (pad gate).
+        let ss = select(1.0, r, creature_gate(i.ipad));
+        local = local * ss;
         let tt = i.taux.x;
-        let amp = 0.42 * (0.25 + 0.75 * tt);
+        let amp = 0.42 * ss * (0.25 + 0.75 * tt);
         let ph = tt * 8.0 - t * i.iwave + i.iphase;
         local.y = local.y + amp * sin(ph);
         local.z = local.z + amp * 0.7 * sin(ph * 0.83 + 1.3);
@@ -543,17 +1225,76 @@ fn vs(i: VIn) -> VOut {
             breathe = breathe * (1.0 + 0.045 * sin(local.x * 7.0));
         }
         local = local * breathe * r;
-        nuv = vec4<f32>(normalize(i.tpos.xyz), 0.0);
+        nuv = vec4<f32>(normalize(i.tpos.xyz), i.ipad);
     } else if (id < 7.5) {
-        // antennae + limb stubs: gentle enzymless wave (amp tapers to tip)
+        // antennae + limb chains: gentle wave (amp tapers to tip). A2:
+        // archetype limbs are authored in body-length units and scale by the
+        // instance radius; queen rows keep the prebaked world-unit stubs
+        // (pad gate).
+        let ss = select(1.0, r, creature_gate(i.ipad));
+        local = local * ss;
         let tt = i.taux.x;
-        let amp = 0.05 * (0.3 + 0.7 * (1.0 - tt));
+        let amp = 0.05 * ss * (0.3 + 0.7 * (1.0 - tt));
         local.y = local.y + amp * sin(tt * 7.0 - t * i.iwave * 0.7 + i.iphase);
         nuv = vec4<f32>(normalize(i.tpos.xyz), tt);
     } else {
         // crown spikes: dignified slow shimmer
         local = local * (1.0 + 0.035 * sin(t * 1.7 + i.iphase * 0.5)) * r;
         nuv = vec4<f32>(normalize(i.tpos.xyz), 0.0);
+    }
+    // A3 body-motion block: creature rows only (pad gate keeps the queen
+    // template rows pad 0/1 and blob rows pad 0 byte-identical to before;
+    // membrane/core ids < 2.5 never exist on archetype meshes). The drive
+    // fields are CPU-computed per frame from the organism's actual gait
+    // speed (position delta / dt) — pure view-side motion on top of the
+    // authoritative sim row. Ovum-stage safety: any future egg-stage row
+    // convention (pad == 0) automatically fails `creature_gate` and does
+    // not animate.
+    if (creature_gate(i.ipad) && id >= 2.5) {
+        // small-angle pitch/roll about the local origin (equivalent to
+        // rotating after the heading yaw about the heading-local axes)
+        let cp = cos(i.imotion.y);
+        let sp = sin(i.imotion.y);
+        let cr = cos(i.imotion.z);
+        let sr = sin(i.imotion.z);
+        let p0 = vec2<f32>(local.x, local.y);
+        local.x = p0.x * cp - p0.y * sp;
+        local.y = p0.x * sp + p0.y * cp;
+        let r0 = vec2<f32>(local.z, local.y);
+        local.z = r0.x * cr - r0.y * sr;
+        local.y = r0.x * sr + r0.y * cr;
+        // vertical bob lifts ABOVE the grounded origin. Per-part animation
+        // is unavailable per-instance, but the static material ids are:
+        // CODE_LIMB verts below the trunk midline are leg verts (keep 3/4
+        // of their bob so the feet stay near the ground), CODE_HEAD verts
+        // (6.25) nod anti-phase to the rear (quadruped head counter-bob).
+        let leg_v = (id > 6.9 && id < 7.1 && i.tpos.y < 0.0);
+        var gain = 1.0;
+        if (id > 6.2 && id < 6.3) {
+            gain = -0.6; // head nod anti-phase
+        } else if (leg_v) {
+            gain = 0.25; // feet stay near the ground
+        }
+        local.y = local.y + i.imotion.x * gain;
+        // limb stride swing/lift: per-leg phase = accrued phase + template-x
+        // bucket offset {front:+0, mid:+PI/2, rear:+PI} + z side parity
+        // (left/right anti-phase rows => diagonal pairs / tripod tread)
+        if (leg_v && i.idrive.x > 0.0) {
+            let bucket = select(1.5707963, 3.1415926, i.tpos.x < -0.24);
+            let b2 = select(0.0, bucket, i.tpos.x < 0.0);
+            let th = i.imotion.w + b2 + select(3.1415926, 0.0, i.tpos.z > 0.0);
+            local.x = local.x + i.idrive.x * sin(th);
+            local.y = local.y + i.idrive.y * max(0.0, sin(th + 1.0));
+        }
+        // squash-stretch along body Y: walk-coupled quarter-lag term (drive.z,
+        // phase-locked to the stride via imotion.w) + slow ambient breathing
+        // (drive.w, rides the instance wave/phase channels). Legs skip it so
+        // feet are not pumped.
+        let squash = i.idrive.z * sin(i.imotion.w - 1.5707963)
+                   + i.idrive.w * sin(t * i.iwave * 0.55 + i.iphase);
+        if (!leg_v) {
+            local.y = local.y * (1.0 + squash);
+        }
     }
     var world = vec3<f32>(0.0);
     if (id != 5.0) {
@@ -588,6 +1329,12 @@ struct FsIn {
     @location(1) nuv: vec4<f32>,
     @location(2) misc: vec4<f32>,    // (turgor, age, wave, phase)
 };
+
+// A2 sat_tint channel: body-branch verts ride sat_tint in nuv.w (instance
+// pad -> VS nuv.w). Exactly neutral (1.0) for queen rows (pad = 0.0/1.0).
+fn creature_tint(w: f32) -> f32 {
+    return select(1.0, 0.85 + 0.5 * w, (w > 0.001) && (w < 0.5));
+}
 
 fn hsv(h: f32, s: f32, val: f32) -> vec3<f32> {
     let i = i32(floor(h * 6.0));
@@ -656,13 +1403,15 @@ fn fs(fi: FsIn) -> @location(0) vec4<f32> {
         col = hsv(hue, sat * 0.9, 0.55);
         a_mat = edge * 0.85;
     } else if (id < 7.0) {
-        // queen body lobes: gum-like body color, rim-lit like the membrane
-        // but more opaque; brighter with turgor + a subtle energy pulse
+        // queen body lobes / creature body-head-eye-wing: gum-like body
+        // color, rim-lit like the membrane but more opaque; brighter with
+        // turgor + a subtle energy pulse. A2: per-genome sat_tint nudges the
+        // chroma (neutral for queens + default fallback descriptors).
         let n = normalize(fi.nuv.xyz);
         let lam = clamp(abs(dot(n, sun)), 0.0, 1.0);
         let rim = clamp(1.0 - lam, 0.0, 1.0);
         let pulse = 0.03 * sin(t * 1.4);
-        col = hsv(hue, sat * 0.88, mix(0.34, 0.56, lam) + pulse) + rim * 0.14;
+        col = hsv(hue, sat * 0.88 * creature_tint(fi.nuv.w), mix(0.34, 0.56, lam) + pulse) + rim * 0.14;
         a_mat = 0.78;
     } else if (id < 7.5) {
         // antennae + limbs: darker chitin

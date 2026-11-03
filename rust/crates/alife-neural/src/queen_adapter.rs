@@ -5,20 +5,20 @@
 //! this crate's spiking runtime; the runtime itself never knows about
 //! coordinator types.
 //!
-//! Mapping (documented model decisions, all channels in use â€” no zeroed
-//! islands; see [`QueenSensoryMapping`]):
-//! - `food_dir`            -> food cos/sin channel pair (chemical-taxis pair)
-//! - `food_dist`           -> food-proximity channel, linear rate encoding of
-//!                            `1 / (1 + dist)` (bounded monotone inverse)
-//! - `heading`             -> (cos, sin) pair on the temperature-proxy
-//!                            (light-alias) directional channels
-//! - `speed`               -> optic-speed channel (rate)
-//! - `energy_frac`         -> ground-contact channel (rate)
-//! - `hazard`              -> obstacle-proximity channel (rate)
-//! - `edge_dist` / `density` -> the two slots of the formerly directional
-//!                            optic pool, reused as scalar rate slots (the
-//!                            optic-flow direction is NOT represented)
-//! - `signal_sample`       -> queen-signal channel (rate)
+//! Mapping (documented model decisions, all channels in use — no zeroed
+//! islands; see [`QueenSensoryMapping`] and [`propose_region_binding`]):
+//! - `food_dir` / `food_dist` -> the food cos/sin/prox channels, bound
+//!   (when the sugar population is available) inside the REAL sugar
+//!   gustatory cells, else the structurally-healthiest `cb_sensory` slices
+//!   — the food cue is carried as a CHEMOSENSORY stream, never invented
+//!   anatomy.
+//! - `heading` -> (cos, sin) pair on the temperature-proxy (light-alias)
+//!   directional channels.
+//! - `speed` -> optic-speed channel (rate); `energy_frac` -> ground contact
+//!   (`vnc_sensory` mechanoreceptors); `hazard` -> obstacle-proximity
+//!   channel (`sensory_ascending`/`ascending_neuron` relays).
+//! - `edge_dist` / `density` -> unmapped (`None` channels).
+//! - `signal_sample` -> queen-signal channel (ascending relay cells).
 //!
 //! Motor decoding: `move_dir` normalized to a unit-or-zero vector; and the
 //! rest are hard-clamped to the documented bounds. Behavior there is
@@ -158,20 +158,50 @@ impl QueenBrainAdapter {
         seed: u32,
         cells_per_channel: usize,
     ) -> Result<Self, RuntimeBuildError> {
+        Self::new_for_subnetwork_with_sugar(connectome, seed, cells_per_channel, None)
+    }
+
+    /// [`new_for_subnetwork_with_cells`] plus the OPTIONAL real sugar sensory
+    /// population (original MaleCNS body ids). When provided, the food
+    /// channels (7..=9) bind inside the ACTUAL sugar-gustatory cells (mapped
+    /// through the preserved `body_id` on the subnetwork); when absent, they
+    /// fall back to the structurally-defensible `cb_sensory` class — never a
+    /// fabricated anatomy.
+    ///
+    /// Calibrated operating point (measured against the 166k MaleCNS queen
+    /// subnetwork; all runtime CALIBRATION knobs that persist across
+    /// snapshots — the LIF engine itself is untouched):
+    /// - afferent rate window 3..63 Hz with 30 (mV-equivalent) injected
+    ///   pulses, so [0,1] channels clear the network's tonic self-run;
+    /// - `weight_scale` 0.45 + 20 event-current clamp: raw MaleCNS weights
+    ///   are signed synaptic COUNTS; at 1.0 they push the LIF into an
+    ///   inhibitory runaway (measured: mean membrane -> -300 mV, sustained
+    ///   >1000 spikes/tick), while < 0.15 leaves it inert. 0.45 sits in the
+    ///   measured stable band (~640 spikes/tick warm steady state, bounded
+    ///   membrane envelope) where afferent scene contrast survives to decode
+    ///   populations (measured per-cell reproducible deltas 45..122 Hz at a
+    ///   ~1 Hz run-to-run sigma).
+    /// Fixtures/tests that do not use this constructor keep runtime defaults
+    /// (weight_scale 1.0 / clamp 40).
+    pub fn new_for_subnetwork_with_sugar(
+        connectome: Arc<Connectome>,
+        seed: u32,
+        cells_per_channel: usize,
+        sugar_bodies: Option<&[u64]>,
+    ) -> Result<Self, RuntimeBuildError> {
         let mut rt = FlyBrainRuntime::new(connectome, seed)?;
-        // Queen-channel calibration (measured operating point; the LIF engine
-        // is untouched): the 40k-cell network self-runs at ~19 Hz mean, so the
-        // stock 4..30 Hz afferent rate window is drowned out. The queen's
-        // afferent cells encode [0,1] channels over a wider 3..63 Hz rate
-        // window (rate encoder gain), giving scene changes enough contrast to
-        // be visible through the tonic intrinsic background.
         rt.sensory.gain_hz = 60.0;
         rt.sensory.baseline_hz = 3.0;
+        rt.sensory.pulse_current = 30.0;
+        rt.weight_scale = 0.45;
+        rt.event_current_clamp = 20.0;
         rt.sensory.channel_cells = cells_per_channel.max(1);
         // re-derive the encoders vector for the new slot count
         rt.encoders
             .resize(crate::sensory::inputs_needed(&rt.sensory), crate::sensory::Encoder::Rate);
-        if let Some((binding, motor_candidates)) = propose_region_binding(rt.connectome(), rt.sensory.channel_cells) {
+        if let Some((binding, motor_candidates)) =
+            propose_region_binding(rt.connectome(), rt.sensory.channel_cells, sugar_bodies)
+        {
             rt.set_input_binding(&binding);
             auto_tune_output_binding(&mut rt, &motor_candidates);
         }
@@ -190,6 +220,16 @@ impl QueenBrainAdapter {
         seed: u32,
     ) -> Result<Self, RuntimeBuildError> {
         Self::new_for_subnetwork(connectome, seed)
+    }
+
+    /// [`new_from_connectome`] with the sugar population available (see
+    /// [`QueenBrainAdapter::new_for_subnetwork_with_sugar`]).
+    pub fn new_from_connectome_with_sugar(
+        connectome: Arc<Connectome>,
+        seed: u32,
+        sugar_bodies: Option<&[u64]>,
+    ) -> Result<Self, RuntimeBuildError> {
+        Self::new_for_subnetwork_with_sugar(connectome, seed, 2, sugar_bodies)
     }
 
     pub fn runtime(&self) -> &FlyBrainRuntime {
@@ -358,19 +398,27 @@ pub struct MotorClassCandidate {
 /// Region-grounded sensory binding for an IMPORTED connectome
 /// (documented model decision — the connectivity itself is untouched):
 ///
-/// - Afferent channels are pooled onto real sensory subpopulations by their
-///   superclass label — limited by the import's MEASURED census: there are
-///   no gustatory receptors in this subnetwork, so food cues ride disjoint
-///   `ol_sensory` slices as odor streams (documented, not invented
-///   anatomy): visual channels onto visual/`ol_sensory` cells, threat
-///   channel onto another `ol_sensory` slice, ground contact onto
-///   `vnc_sensory` mechanoreceptors, food channels onto further
-///   `ol_sensory` slices, and the queen-signal channel onto ascending
-///   sensory cells.
+/// - AFFERENT channels are bound onto real sensory subpopulations by their
+///   superclass label, and the members of each pool are ordered by their
+///   CONNECTIVITY HEALTH: positive outgoing-weight sum (the injected pulse
+///   must be able to leave the cell through a real synapse). Measured
+///   findings this encoding follows (audit of the 166k queen subnetwork):
+///   the default binding's first-N slices of `ol_sensory` were dead afferents
+///   (zero positive out-edges across the whole n=3335 class), so a food or
+///   threat cue injected there never propagated.
+///   Channel assignments (nothing fabricated; census in `label_census`):
+///   visual/heading channels (CH 0..=4) -> `visual_projection`, then
+///   `visual_centrifugal`/`ol_intrinsic` cells; threat alarm (CH 5) and the
+///   queen-signal channel (CH 10) -> `sensory_ascending`/`ascending_neuron`
+///   relays; ground contact (CH 6) -> `vnc_sensory` mechanoreceptors; food
+///   channels (CH 7..=9) -> the REAL sugar gustatory cells (when the caller
+///   supplies the sugar population's original MaleCNS body ids, mapped into
+///   the subnetwork via the preserved `body_id`) else `cb_sensory` slices
+///   (central sensory class — the food cue as a chemosensory stream, clearly
+///   NOT gustation when the population file is absent);
 /// - Motor output decodes POOL MEAN rates over FUNCTIONAL channels mined from
 ///   the annotated motor classes (see [`MotorClassCandidate`] and
-///   [`auto_tune_output_binding`] — anatomical populations and motor channels
-///   are distinct; the channel count is however many the data defends).
+///   [`auto_tune_output_binding`]).
 ///
 /// Every cell is a real, labeled neuron — nothing is fabricated. Deterministic.
 /// Returns `None` when the connectome lacks labels (or is too small) so the
@@ -378,6 +426,7 @@ pub struct MotorClassCandidate {
 pub fn propose_region_binding(
     conn: &Connectome,
     cells_per_channel: usize,
+    sugar_bodies: Option<&[u64]>,
 ) -> Option<(Vec<usize>, Vec<MotorClassCandidate>)> {
     if conn.regions.is_empty() || conn.n() < 120 {
         return None;
@@ -437,59 +486,82 @@ pub fn propose_region_binding(
             taken[c] = true;
         }
     }
-    // Measured anatomical census of the imported subnetwork (label_census):
-    // REAL peripheral chemoreceptors (sugar/gustatory/taste/odor naming) DO
-    // NOT EXIST — the only chemosensory class present is `ol_sensory`
-    // (n=3335), plus mechanosensory `vnc_sensory` (n=301) and visual
-    // populations. Bindings therefore say what the data supports and no
-    // more:
-    // - optical-flow / heading channels (CH 0..=4) -> visual populations;
-    // - the threat-alarm channel (CH 5) -> an `ol_sensory` slice (odor
-    //   stream; no dedicated nociceptor population exists);
-    // - ground contact (CH 6) -> `vnc_sensory` (leg mechanoreceptors);
-    // - food channels (CH 7..=9) -> further disjoint `ol_sensory` slices
-    //   (the food cue is carried as an odor stream — NOT as gustation, and
-    //   never as mechanosensation);
-    // - internal coordination signal (CH 10) -> ascending relay cells.
-    // Fallbacks ride the umbrella `sensory` classes only to satisfy the
-    // runtime's binding-length contract, always AFTER the semantic pools.
-    let pool = |pred: &dyn Fn(&str) -> bool| -> Vec<usize> {
-        (0..n)
-            .filter(|&i| !taken[i] && class_of(i).map_or(false, |r| pred(r)))
-            .collect()
+    // Connectivity health: a cell can only CARRY an injected pulse forward
+    // through positive outgoing synapses, so pool members are ordered by
+    // their positive out-weight sum (ties: ascending index). Deterministic.
+    let pos_out = |i: usize| -> f32 {
+        let (rs, re) = (conn.row_offsets[i] as usize, conn.row_offsets[i + 1] as usize);
+        (rs..re).filter(|&p| conn.weights[p] > 0.0).map(|p| conn.weights[p]).sum()
     };
-    let visual = pool(&|r| {
-        r.contains("visual") || r.contains("ol_sensory") || r.contains("ol_intrinsic")
-    });
-    let odor = pool(&|r| r.contains("ol_sensory"));
-    let central_sensory =
-        pool(&|r| r.contains("sensory") && !r.contains("vnc") && !r.contains("descending"));
-    let vnc_sensory = pool(&|r| r.contains("vnc_sensory"));
-    let ascending = pool(&|r| r.contains("ascending") && r.contains("sensory"));
+    let health_sorted = |mut v: Vec<usize>| -> Vec<usize> {
+        v.sort_unstable_by(|&a, &b| {
+            pos_out(b).partial_cmp(&pos_out(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+        });
+        v
+    };
+    let pool = |pred: &dyn Fn(&str) -> bool| -> Vec<usize> {
+        health_sorted(
+            (0..n)
+                .filter(|&i| !taken[i] && class_of(i).map_or(false, |r| pred(r)))
+                .collect(),
+        )
+    };
+    let visual = pool(&|r| r == "visual_projection");
+    let visual_secondary = pool(&|r| r == "visual_centrifugal" || r == "ol_intrinsic");
+    let ascending = pool(&|r| r == "sensory_ascending" || r == "ascending_neuron");
+    let vnc_sensory = pool(&|r| r == "vnc_sensory");
+    let central_sensory = pool(&|r| r == "cb_sensory");
     let sensory_like = pool(&|r| r.contains("sensory"));
     let ascending_any = pool(&|r| r.contains("ascending"));
 
+    // The REAL sugar gustatory population when its original body ids are
+    // supplied (package `populations/sugar.i32` + `neurons/body_id.i64`),
+    // mapped into this subnetwork through the preserved body ids and then
+    // health-ordered itself.
+    let sugar: Vec<usize> = sugar_bodies
+        .map(|bodies| {
+            let by_body: std::collections::HashMap<u64, usize> =
+                (0..n).map(|i| (conn.node_meta[i].body_id, i)).collect();
+            health_sorted(bodies.iter().filter_map(|&b| by_body.get(&b).copied()).collect())
+        })
+        .unwrap_or_default();
+
     let mut binding: Vec<usize> = Vec::new();
     let cells_per_channel = cells_per_channel.max(1);
-    // channel order follows `crate::sensory::CH_*`:
-    // 0 optic speed, 1..=2 optic dirs, 3..=4 heading(light) -> visual pool
-    for _ in 0..5 {
-        assign_slots(&mut taken, &mut binding, cells_per_channel, &[&visual], &[&sensory_like, &ascending_any])?;
+    // channel order follows `crate::sensory::CH_*`. Primary pools first, then
+    // the same-class fallbacks, then umbrella fillers — semantics degrade
+    // honestly (same-cell-class relays), never onto fabricated anatomy:
+    let visual_pools = [visual.as_slice(), visual_secondary.as_slice(), sensory_like.as_slice()];
+    let heading_pools =
+        [visual_secondary.as_slice(), visual.as_slice(), sensory_like.as_slice()];
+    let relay_pools = [ascending.as_slice(), ascending_any.as_slice(), sensory_like.as_slice()];
+    let ground_pools = [vnc_sensory.as_slice(), sensory_like.as_slice()];
+    let food_pools = [sugar.as_slice(), central_sensory.as_slice(), sensory_like.as_slice()];
+    let channel_pools: [&[&[usize]]; CHANNEL_COUNT] = [
+        &visual_pools,    // 0 optic speed
+        &visual_pools,    // 1 optic dir cos
+        &visual_pools,    // 2 optic dir sin
+        &heading_pools,   // 3 heading cos (light-alias)
+        &heading_pools,   // 4 heading sin
+        &relay_pools,     // 5 threat alarm
+        &ground_pools,    // 6 ground contact
+        &food_pools,      // 7 food proximity
+        &food_pools,      // 8 food dir cos
+        &food_pools,      // 9 food dir sin
+        &relay_pools,     // 10 queen coordination signal
+    ];
+    for pools in channel_pools {
+        assign_slots(&mut taken, &mut binding, cells_per_channel, pools)?;
     }
-    // 5 threat alarm -> ol_sensory slice (odor stream), central sensory fill
-    assign_slots(&mut taken, &mut binding, cells_per_channel, &[&odor, &central_sensory], &[&sensory_like])?;
-    // 6 ground contact -> vnc sensory (mechanosensation), central fill
-    assign_slots(&mut taken, &mut binding, cells_per_channel, &[&vnc_sensory, &central_sensory], &[&sensory_like])?;
-    // 7..=9 food proximity/direction -> further ol_sensory slices (odor)
-    for _ in 0..3 {
-        assign_slots(&mut taken, &mut binding, cells_per_channel, &[&odor, &central_sensory], &[&sensory_like])?;
-    }
-    // 10 queen coordination signal -> ascending sensory
-    assign_slots(&mut taken, &mut binding, cells_per_channel, &[&ascending, &ascending_any], &[&sensory_like, &ascending_any])?;
     // safety: exact-length filler (the runtime requires len == inputs_needed)
     let target = cells_per_channel * CHANNEL_COUNT;
     while binding.len() < target {
-        assign_slots(&mut taken, &mut binding, 1, &[&sensory_like], &[&ascending_any])?;
+        assign_slots(
+            &mut taken,
+            &mut binding,
+            1,
+            &[&[sensory_like.as_slice(), ascending_any.as_slice()].concat()],
+        )?;
     }
 
     Some((binding, classes))
@@ -502,11 +574,10 @@ fn assign_slots(
     binding: &mut Vec<usize>,
     slots: usize,
     pools: &[&[usize]],
-    filler: &[&[usize]],
 ) -> Option<()> {
     for _ in 0..slots {
         let mut got: Option<usize> = None;
-        'find: for src in pools.iter().chain(filler.iter()) {
+        'find: for src in pools {
             for &c in *src {
                 if !taken[c] {
                     got = Some(c);
@@ -521,367 +592,299 @@ fn assign_slots(
     Some(())
 }
 
+/// Runtime diagnostics switch: the queen path is SILENT by default (no
+/// per-build/per-frame stderr); set `ALIFE_QUEEN_BRAIN_DIAG=1` to observe the
+/// calibration log. Documented policy, enforced at every queen print site.
+fn queen_diag() -> bool {
+    std::env::var("ALIFE_QUEEN_BRAIN_DIAG").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Probe schedule per scene: warm-up (state settles on the scene), then a
+/// count window split into two halves for the within-scene sigma estimate.
+const AUTO_TUNE_WARM_TICKS: usize = 100;
+const AUTO_TUNE_HALF_TICKS: usize = 100;
+const AUTO_TUNE_COUNT_TICKS: usize = AUTO_TUNE_HALF_TICKS * 2;
+
 /// FUNCTIONAL channel assembly from annotated classes for the region-grounded
 /// queen run mode (documented, all-offline, deterministic).
 ///
-/// ANATOMICAL POPULATIONS and MOTOR CHANNELS are distinct here, and the
-/// decoder installs exactly as many channels as the data defends (K in
-/// 1..=`OUTPUT_CELL_COUNT`); body DOFs beyond K decode neutral.
+/// ANATOMICAL POPULATIONS and MOTOR CHANNELS are distinct: the decoder
+/// installs exactly as many channels as the measured data defends (K in
+/// 1..=`OUTPUT_CELL_COUNT`), and body DOFs beyond K decode neutral. The
+/// assembly is a PREFIX: DOFs pick their measured pools in fixed
+/// decode-slot order, and the first DOF without a defensible pool ends the
+/// decoder (a hole mid-chain Would mis-map every later slot onto the wrong
+/// DOF).
 ///
-/// Pipeline:
-/// 1. probe: alternate three scene vectors over the just-installed afferent
-///    binding (FOOD scene, HAZARD scene, OBSTACLE-ONLY scene — deliberately
-///    different from the later validation scenarios); collect per-member
-///    per-phase mean rates over 12 phases.
-/// 2. per-member stats: scene means + WITHIN-scene noise sigma (correlated
-///    members mean honest noise is the pooled sigma average, NOT the
-///    1/sqrt(K)-reduced value).
-/// 3. channel assembly, per class, from MEASURED RESPONSE PROFILES and REAL
-///    CONNECTIVITY:
-///    - `descending_neuron`: greedy correlation clustering of the three-scene
-///      response vectors; an ENSEMBLE qualifies when it holds >= 4 neurons
-///      with at least one internal synapse and a pooled scene response above
-///      the pooled within-scene noise floor.
-///    - `cb_motor`: evaluated as a separate motor-related population — one
-///      channel when its pooled response clears the same noise floor.
-///    - `vnc_motor`: a SINGLE-CELL signal (pool of that one neuron's own
-///      calibrated rate, not a population average).
-///    - `efferent_ascending`: deliberately NOT an output population (afferent
-///      transport); reported in diagnostics only.
-///    Channel-to-DOF assignment is STRUCTURAL — the dataset provides no
-///    per-neuron semantic for specific fly behaviours; this limitation is
-///    documented rather than inventing a biological mapping. The
-///    CALIBRATION (measured baseline/normalize ranges) makes each channel an
-///    honest relative readout of its own scene response.
+/// Pipeline (v2, replaced the 3-scene clustering after the audit):
+/// 1. probe every DECODE slot's focal sensory channel directly — one scene
+///    per sign per slot, plus one rest scene:
+///    DirX <- CH_FOOD_COS(±1), DirY <- CH_FOOD_SIN(±1), Intensity <-
+///    CH_OBSTACLE(+1), Turn <- CH_LIGHT_SIN(±1), FeedSeek <-
+///    CH_FOOD_PROX(+1), Emit <- CH_QUEEN(+1). Every driven scene starts from
+///    a snapshot-restored common state, so a scene's measured rate is its
+///    MARGINAL effect, not a carryover.
+///    Measured justification (snr/rep probes on the 166k subnetwork): the
+///    network's per-cell scene responses are deterministic (run-to-run sigma
+///    ~1 Hz) with reproducible deltas up to ~122 Hz on descending/motor/relay
+///    cells — real channel-locked contrast exists to be calibrated against.
+/// 2. per-DOF pool assembly from MEASURED member responses: members whose
+///    drift direction matches the pool's sign (signed slots) / a positive
+///    response (gate slots), ordered by |delta| descending, capped per pool;
+///    the gate is the pooled scene contrast clearing the pooled within-scene
+///    noise floor (2.5 × sigma, min 3 Hz). This is the same statutory noise
+///    floor criterion the previous version used on 3-scene clusters, applied
+///    where the semantics now point: at a specific channel.
+/// 3. calibration per installed channel: baseline = MEASURED pooled rest
+///    rate; range = MEASURED pooled scene contrast (max over ± scenes),
+///    clamped to `[2.0, OUTPUT_CALIB_RANGE_MAX_HZ]`; the decoder's calibrated
+///    `(ema - base)/range` readout then reproduces ±1 exactly at the probe's
+///    drive extremes.
 /// 4. install via `set_output_pools` + `set_motor_calibration` (K channels).
-///    When NO channel is defensible, the SNR-ranked SINGLE-CELL decoder
-///    remains active so the pool decoder can be compared against it.
+///    When NO DOF is defensible, the SNR-ranked SINGLE-CELL decoder remains
+///    active as the documented comparison baseline.
 fn auto_tune_output_binding(rt: &mut FlyBrainRuntime, classes: &[MotorClassCandidate]) {
-    const PHASE_TICKS: usize = 150;
-    const PHASES: usize = 12; // 4 rounds x 3 calibration scenes
     let members: Vec<usize> = classes.iter().flat_map(|c| c.cells.iter().copied()).collect();
     let n = rt.connectome().n();
     if members.is_empty() || members.iter().any(|&m| m >= n) {
         return;
     }
-    use crate::sensory::{CH_FOOD_COS, CH_FOOD_PROX, CH_GROUND, CH_LIGHT_COS, CH_OBSTACLE, CH_QUEEN};
-    let budget = crate::runtime::TickBudget::default();
+    use crate::sensory::{CH_FOOD_COS, CH_FOOD_PROX, CH_FOOD_SIN, CH_LIGHT_SIN, CH_OBSTACLE, CH_QUEEN};
+    // decode slot <- focal channel (documented contract, see the fn doc)
+    const FOCAL: [usize; crate::motor::OUTPUT_CELL_COUNT] =
+        [CH_FOOD_COS, CH_FOOD_SIN, CH_OBSTACLE, CH_LIGHT_SIN, CH_FOOD_PROX, CH_QUEEN];
+    const SIGNED_DOF: [bool; crate::motor::OUTPUT_CELL_COUNT] = [true, true, false, true, false, false];
+
     let n_mem = members.len();
     let mut slot_of = vec![usize::MAX; n];
     for (k, &c) in members.iter().enumerate() {
         slot_of[c] = k;
     }
-    // per-member rates across 3 calibration scenes (phase p: scene p % 3)
-    let mut phase_rates = vec![0.0f32; PHASES * n_mem];
-    for phase in 0..PHASES {
-        let mut chans = [0.0f32; CHANNEL_COUNT];
-        match phase % 3 {
-            0 => {
-                // FOOD scene
-                chans[CH_FOOD_COS] = 1.0;
-                chans[CH_FOOD_PROX] = 0.9;
-                chans[CH_GROUND] = 0.1;
-                chans[CH_QUEEN] = 0.2;
-            }
-            1 => {
-                // HAZARD scene (threat present, heading cues active)
-                chans[CH_OBSTACLE] = 0.8;
-                chans[CH_LIGHT_COS] = 0.7;
-                chans[CH_GROUND] = 0.8;
-            }
-            _ => {
-                // OBSTACLE-ONLY scene (threat, no heading cues)
-                chans[CH_OBSTACLE] = 0.9;
+
+    // scene vectors: [rest(0)] + per-DOF ± drive
+    let scene_chan = |scene: usize| -> [f32; CHANNEL_COUNT] {
+        let mut ch = [0.0f32; CHANNEL_COUNT];
+        if scene > 0 {
+            // scene s drives dof ( (s-1) ... ): dof emits 1 (+) or 2 (−) scenes
+            let mut s = scene - 1;
+            for dof in 0..crate::motor::OUTPUT_CELL_COUNT {
+                let drive = if SIGNED_DOF[dof] { 2 } else { 1 };
+                if s < drive {
+                    ch[FOCAL[dof]] = if s == 0 { 1.0 } else { -1.0 };
+                    break;
+                }
+                s -= drive;
             }
         }
-        for _ in 0..PHASE_TICKS {
+        ch
+    };
+    let scene_count =
+        1 + (0..crate::motor::OUTPUT_CELL_COUNT).map(|d| if SIGNED_DOF[d] { 2 } else { 1 }).sum::<usize>();
+
+    // per-scene member mean rates (Hz) and within-scene sigmas; every
+    // non-rest scene measures on the restored common state.
+    let budget = crate::runtime::TickBudget::default();
+    let home = rt.snapshot();
+    let mut rates: Vec<Vec<f32>> = Vec::with_capacity(scene_count);
+    let mut sigmas: Vec<Vec<f32>> = Vec::with_capacity(scene_count);
+    for scene in 0..scene_count {
+        if scene > 0 {
+            rt.restore_snapshot(home.clone());
+        }
+        let chans = scene_chan(scene);
+        let mut acc1 = vec![0.0f32; n_mem];
+        let mut acc2 = vec![0.0f32; n_mem];
+        for t in 0..AUTO_TUNE_WARM_TICKS + AUTO_TUNE_COUNT_TICKS {
             let _ = rt.tick_channels(&chans, &budget);
+            if t < AUTO_TUNE_WARM_TICKS {
+                continue;
+            }
+            let half = t - AUTO_TUNE_WARM_TICKS < AUTO_TUNE_HALF_TICKS;
             for &s in rt.spike_ids_last() {
                 let k = slot_of.get(s as usize).copied().unwrap_or(usize::MAX);
                 if k < n_mem {
-                    phase_rates[phase * n_mem + k] += 1.0;
+                    if half {
+                        acc1[k] += 1.0;
+                    } else {
+                        acc2[k] += 1.0;
+                    }
                 }
             }
         }
-        for k in 0..n_mem {
-            let tag = phase * n_mem + k;
-            phase_rates[tag] /= PHASE_TICKS as f32 * 0.001;
-        }
+        let per_half = AUTO_TUNE_HALF_TICKS as f32 * 0.001;
+        rates.push(
+            acc1.iter().zip(&acc2).map(|(&a, &b)| (a + b) / (2.0 * per_half)).collect::<Vec<f32>>(),
+        );
+        sigmas.push(
+            acc1.iter().zip(&acc2).map(|(&a, &b)| {
+                // two-sample sigma estimate, honest floor at 1 Hz
+                ((a - b) / (std::f32::consts::SQRT_2 * per_half)).abs().max(1.0)
+            }).collect::<Vec<f32>>(),
+        );
     }
-    // per-member stats: scene means, within-scene sigma, scene spread, SNR
-    let mut m_mean = vec![[0.0f32; 3]; n_mem];
-    let mut m_sigma = vec![0.0f32; n_mem];
-    let mut m_spread = vec![0.0f32; n_mem];
-    for k in 0..n_mem {
-        let mut sums = [0.0f64; 3];
-        let mut mo = [0.0f64; 3];
-        for phase in 0..PHASES {
-            let hz = phase_rates[phase * n_mem + k] as f64;
-            let tag = phase % 3;
-            sums[tag] += hz;
-            mo[tag] += hz * hz;
-        }
-        let per = (PHASES / 3) as f64;
-        let mut means = [0.0f32; 3];
-        let mut var = 0.0f64;
-        for t in 0..3 {
-            means[t] = (sums[t] / per) as f32;
-            let m2 = means[t] as f64;
-            var += (mo[t] / per - m2 * m2).max(0.0);
-        }
-        m_mean[k] = means;
-        m_sigma[k] = ((var / 3.0).max(1.0) as f32).sqrt().max(1.0);
-        m_spread[k] = (means[0] - means[1])
-            .abs()
-            .max((means[1] - means[2]).abs())
-            .max((means[0] - means[2]).abs());
-    }
-    let m_snr: Vec<f32> = (0..n_mem).map(|k| m_spread[k] / m_sigma[k]).collect();
+    rt.restore_snapshot(home.clone());
+
+    // pooled statistics of a member set: pooled mean rate per scene +
+    // CONSERVATIVE pooled sigma (fully-correlated members — the mean of the
+    // member sigmas, NOT the sqrt(K)-reduced independent estimate).
+    let pooled_rate = |ks: &[usize], scene: usize| -> f32 {
+        ks.iter().map(|&k| rates[scene][k]).sum::<f32>() / ks.len() as f32
+    };
+    let pooled_sigma = |ks: &[usize], scene: usize| -> f32 {
+        ks.iter().map(|&k| sigmas[scene][k]).sum::<f32>() / ks.len() as f32
+    };
 
     struct Chan {
-        label: String,
         members: Vec<usize>,
         base: f32,
-        spread: f32,
-        sigma: f32,
+        range: f32,
     }
-    // MEASURED pooled stats of a member set (member indices into the flat
-    // member list): the pool's actual per-phase mean-rate series is scored
-    // directly, so member correlations are fully accounted for — this is not
-    // the conservative fully-correlated noise model.
-    let pooled = |ks: &[usize]| -> ([f32; 3], f32, f32, f32) {
-        let mut sums = [0.0f64; 3];
-        let mut mo = [0.0f64; 3];
-        for phase in 0..PHASES {
-            let m = ks
-                .iter()
-                .map(|&k| phase_rates[phase * n_mem + k])
-                .sum::<f32>()
-                / ks.len() as f32;
-            let tag = phase % 3;
-            sums[tag] += m as f64;
-            mo[tag] += (m as f64) * (m as f64);
-        }
-        let per = (PHASES / 3) as f64;
-        let mut mean = [0.0f32; 3];
-        let mut var = 0.0f64;
-        for t in 0..3 {
-            mean[t] = (sums[t] / per) as f32;
-            let m2 = sums[t] / per;
-            var += (mo[t] / per - m2 * m2).max(0.0);
-        }
-        let base = (mean[0] + mean[1] + mean[2]) / 3.0;
-        let spread =
-            (mean[0] - mean[1]).abs().max((mean[1] - mean[2]).abs()).max((mean[0] - mean[2]).abs());
-        (mean, base, spread, ((var / 3.0).max(1.0) as f32).sqrt())
-    };
-    // a pooled response above this is a real scene response, not drift
-    let noise_floor = |sigma: f32| -> f32 { (2.5 * sigma).max(3.0) };
-
-    let conn = rt.connectome().clone();
-    let edge_between = |a: usize, b: usize| -> bool {
-        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-        for p in conn.row_offsets[lo] as usize..conn.row_offsets[lo + 1] as usize {
-            if conn.col_idx[p] as usize == hi {
-                return true;
-            }
-        }
-        false
-    };
-
+    const POOL_CAP: usize = 12;
     let mut chans: Vec<Chan> = Vec::new();
-
-    // --- (a) descending ensembles: response-profile clustering -------------
-    if let Some(desc) = classes.iter().find(|c| c.label.contains("descending")) {
-        let idx: Vec<usize> = desc.cells.iter().map(|c| slot_of[*c]).collect();
-        // candidates: living members with some scene modulation; ordered by
-        // measured SNR. The hard gate is applied later on MEASURED pooled
-        // stats, where pool averaging has already suppressed independent
-        // single-cell noise.
-        let mut cand: Vec<usize> = idx
-            .into_iter()
-            .filter(|&k| {
-                m_mean[k].iter().sum::<f32>() / 3.0 > 3.0 && m_spread[k] >= 1.0
-            })
+    for dof in 0..crate::motor::OUTPUT_CELL_COUNT {
+        // scenes for this dof: from the scene layout (rest, then dof order)
+        let mut s = 1; // skip rest
+        for d in 0..dof {
+            s += if SIGNED_DOF[d] { 2 } else { 1 };
+        }
+        let plus = s;
+        let minus = if SIGNED_DOF[dof] { Some(s + 1) } else { None };
+        let focal = FOCAL[dof];
+        // per-member contrast vs rest
+        let mut cand: Vec<(f32 /*delta*/, usize /*member slot, sorted later*/)> = (0..n_mem)
+            .map(|k| (rates[plus][k] - rates[0][k], k))
             .collect();
-        cand.sort_unstable_by(|&a, &b| m_snr[b].partial_cmp(&m_snr[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-        eprintln!(
-            "queen channels: descending candidates {}/{} (living+modulated)",
-            cand.len(),
-            desc.cells.len()
-        );
-        // greedy clustering: join the first ensemble whose centroid response
-        // vector is collinear with this member's scene response vector
-        let cos = |u: &[f32; 3], v: &[f32; 3]| -> f32 {
-            let dot = u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
-            let nu = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-            let nv = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-            if nu <= 0.0 || nv <= 0.0 { 0.0 } else { dot / (nu * nv) }
+        if cand.is_empty() {
+            break;
+        }
+        // pool sign: does the class respond up or down to the drive?
+        let all_deltas_mean = cand.iter().map(|(d, _)| *d).sum::<f32>() / n_mem as f32;
+        // candidates: members in the SIGN-CONSISTENT direction (signed slots
+        // take the pooled majority sign; gate slots (Int/prox/emit) take a
+        // positive response by definition of their decode contract).
+        let pool_sign = if SIGNED_DOF[dof] {
+            if all_deltas_mean >= 0.0 { 1.0 } else { -1.0 }
+        } else {
+            1.0
         };
-        let mut clusters: Vec<(Vec<usize>, [f32; 3])> = Vec::new();
-        for &k in &cand {
-            let mut joined = false;
-            for cluster in clusters.iter_mut() {
-                if cos(&m_mean[k], &cluster.1) >= 0.70 {
-                    cluster.0.push(k);
-                    let len = cluster.0.len() as f32;
-                    for t in 0..3 {
-                        cluster.1[t] = (cluster.1[t] * (len - 1.0) + m_mean[k][t]) / len;
-                    }
-                    joined = true;
-                    break;
-                }
-            }
-            if !joined {
-                clusters.push((vec![k], m_mean[k]));
-            }
+        cand.retain(|(d, _)| *d * pool_sign > 0.0);
+        cand.sort_unstable_by(|a, b| b.0.abs().partial_cmp(&a.0.abs()).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        cand.truncate(POOL_CAP);
+        if cand.len() < 3 {
+            break;
         }
-        // an ensemble is defensible when it is a real POPULATION: >= 4
-        // neurons, internally connected, pooled response above its noise floor
-        let mut desc_chans: Vec<Chan> = clusters
-            .into_iter()
-            .enumerate()
-            .filter_map(|(ci, (mut ks, _))| {
-                let size = ks.len();
-                let (_mean, base, spread, sigma) = pooled(&ks);
-                let connected = ks
-                    .iter()
-                    .enumerate()
-                    .any(|(x, &a)| ks[x + 1..].iter().any(|&b| edge_between(members[a], members[b])));
-                let gate = base > 3.0 && spread >= noise_floor(sigma);
-                if size >= 4 {
-                    eprintln!(
-                        "queen channels: descending cluster#{ci} n={size} base={base:.1} spread={spread:.2} sigma={sigma:.2} floor={:.2} connected={connected} gate={gate}",
-                        noise_floor(sigma)
-                    );
-                }
-                if size < 4 || !connected || !gate {
-                    return None;
-                }
-                ks.sort_unstable();
-                let ks: Vec<usize> = ks;
-                let label = desc.label.clone();
-                Some(Chan { label, members: ks, base, spread, sigma })
-            })
-            .collect();
-        desc_chans.sort_unstable_by(|a, b| {
-            b.spread.partial_cmp(&a.spread).unwrap_or(std::cmp::Ordering::Equal).then(a.label.cmp(&b.label))
-        });
-        // leave DOF room for the other classes' defensible channels
-        chans.extend(desc_chans.into_iter().take(4));
-    }
-
-    // --- (b) cb_motor: a separate motor-related population -----------------
-    if let Some(cb) = classes.iter().find(|c| c.label.contains("cb_motor")) {
-        let ks: Vec<usize> = cb.cells.iter().map(|c| slot_of[*c]).collect();
-        if !ks.is_empty() {
-            let (_, base, spread, sigma) = pooled(&ks);
+        let ks: Vec<usize> = cand.iter().map(|(_, k)| *k).collect();
+        let dplus = pooled_rate(&ks, plus) - pooled_rate(&ks, 0);
+        let dminus = minus.map(|m| pooled_rate(&ks, m) - pooled_rate(&ks, 0));
+        let sigma =
+            (pooled_sigma(&ks, plus).powi(2) + pooled_sigma(&ks, 0).powi(2)).sqrt().max(1.0);
+        let contrast = dplus.abs().max(dminus.map(|d| d.abs()).unwrap_or(0.0));
+        let floor = (2.5 * sigma).max(3.0);
+        let sign_ok = if SIGNED_DOF[dof] {
+            // signed slots need BOTH directions present (or at least the +
+            // scene contrast in the pool's direction)
+            dplus * pool_sign > floor
+                && dminus.map_or(true, |d| d * pool_sign < 0.0)
+        } else {
+            dplus > floor
+        };
+        let ok = sign_ok && dplus * pool_sign > floor;
+        if queen_diag() {
             eprintln!(
-                "queen channels: cb_motor n={} base={base:.1} spread={spread:.2} sigma={sigma:.2} floor={:.2}",
+                "queen channels: dof {dof} ch{focal} n={} dplus={dplus:.1} dminus={} sigma={sigma:.1} floor={floor:.1} gate={ok}",
                 ks.len(),
-                noise_floor(sigma)
+                dminus.map(|d| format!("{d:.1}")).unwrap_or_else(|| "n/a".into()),
             );
-            if base > 3.0 && spread >= noise_floor(sigma) {
-                chans.push(Chan {
-                    label: cb.label.clone(),
-                    members: ks,
-                    base,
-                    spread,
-                    sigma,
-                });
-            }
         }
-    }
-
-    // --- (c) vnc_motor: single-cell signal (not a population average) ------
-    if let Some(vnc) = classes.iter().find(|c| c.label.contains("vnc_motor")) {
-        for &cell in &vnc.cells {
-            let k = slot_of[cell];
-            if k >= n_mem {
-                continue;
-            }
-            let base = m_mean[k].iter().sum::<f32>() / 3.0;
-            if base > 3.0 && m_spread[k] >= noise_floor(m_sigma[k]) {
-                chans.push(Chan {
-                    label: format!("{}#cell{cell}", vnc.label),
-                    members: vec![k],
-                    base,
-                    spread: m_spread[k],
-                    sigma: m_sigma[k],
-                });
-            }
+        if !ok {
+            break;
         }
+        let base = pooled_rate(&ks, 0);
+        let range = contrast.clamp(2.0, crate::motor::OUTPUT_CALIB_RANGE_MAX_HZ);
+        chans.push(Chan { members: ks, base, range });
     }
-
-    // NOTE: efferent_ascending is intentionally NOT installed as a motor
-    // output (afferent transport). Its measured response is reported below
-    // for the record.
-    if let Some(ef) = classes.iter().find(|c| c.label.contains("efferent")) {
-        let ks: Vec<usize> = ef.cells.iter().map(|c| slot_of[*c]).collect();
-        let (_, base, spread, sigma) = pooled(&ks);
-        eprintln!(
-            "queen channels: efferent class {:<22} NOT a motor output (report-only: base={base:.1}Hz spread={spread:.2}Hz sigma={sigma:.2}Hz)",
-            ef.label
-        );
-    }
-
-    chans.truncate(crate::motor::OUTPUT_CELL_COUNT);
 
     if chans.is_empty() {
         // SINGLE-CELL decoder (documented comparison baseline): the
-        // best-SNR members across all classes, calibrated per cell. Also
-        // the state whenever no anatomical pool clears the noise floor.
-        let mut ord: Vec<usize> = (0..n_mem).collect();
-        ord.sort_by(|&x, &y| {
-            m_snr[y].partial_cmp(&m_snr[x]).unwrap_or(std::cmp::Ordering::Equal).then(x.cmp(&y))
-        });
-        ord.truncate(crate::motor::OUTPUT_CELL_COUNT);
-        if ord.len() < crate::motor::OUTPUT_CELL_COUNT {
-            return;
-        }
-        let mut cells = [0usize; crate::motor::OUTPUT_CELL_COUNT];
-        let mut bl = vec![0f32; crate::motor::OUTPUT_CELL_COUNT];
-        let mut rg = vec![0f32; crate::motor::OUTPUT_CELL_COUNT];
-        for (slot, &k) in ord.iter().enumerate() {
-            cells[slot] = members[k];
-            bl[slot] = m_mean[k].iter().sum::<f32>() / 3.0;
-            rg[slot] = m_spread[k].max(2.5 * m_sigma[k]).max(2.0)
-                .min(crate::motor::OUTPUT_CALIB_RANGE_MAX_HZ);
-        }
-        eprintln!(
-            "queen decoder: SINGLE-CELL (comparison mode; no defensible population channel) cells={cells:?} SNRs={:?}",
-            ord.iter().map(|&k| m_snr[k]).collect::<Vec<_>>()
-        );
-        if rt.set_output_binding(&cells) {
-            rt.set_motor_calibration(Some(&bl), Some(&rg));
-        }
+        // best-SNR members across all classes, calibrated per cell.
+        single_cell_fallback(rt, &members, &rates, &sigmas);
         return;
     }
 
     // install the measured calibrated functional channels
-    eprintln!("queen decoder: POPULATION ({} functional channels):", chans.len());
-    let refs: Vec<&[usize]> = chans.iter().map(|c| c.members.as_slice()).collect();
-    for (slot, p) in chans.iter().enumerate() {
-        eprintln!(
-            "  [{slot}] {:<24} n={:<3} base={:>7.1}Hz spread={:>6.2}Hz sigma={:>5.2}Hz",
-            p.label,
-            p.members.len(),
-            p.base,
-            p.spread,
-            p.sigma
-        );
+    if queen_diag() {
+        eprintln!("queen decoder: POPULATION ({} functional channels):", chans.len());
+        for (slot, p) in chans.iter().enumerate() {
+            eprintln!(
+                "  [{slot}] {:<24} n={:<3} base={:>7.1}Hz range={:>6.2}Hz",
+                dof_label(slot),
+                p.members.len(),
+                p.base,
+                p.range
+            );
+        }
     }
+    let refs: Vec<&[usize]> = chans.iter().map(|c| c.members.as_slice()).collect();
     if rt.set_output_pools(&refs) {
-        let calib: Vec<f32> = chans
-            .iter()
-            .map(|c| {
-                c.spread.max(2.5 * c.sigma).max(2.0).min(crate::motor::OUTPUT_CALIB_RANGE_MAX_HZ)
-            })
-            .collect();
         let base: Vec<f32> = chans.iter().map(|c| c.base).collect();
-        if !rt.set_motor_calibration(Some(&base), Some(&calib)) {
-            // length mismatch cannot happen (base/calib both K) — defensive
+        let range: Vec<f32> = chans.iter().map(|c| c.range).collect();
+        if !rt.set_motor_calibration(Some(&base), Some(&range)) {
+            // length mismatch cannot happen (both are K) — defensive reset
             rt.set_motor_calibration(None, None);
         }
+    }
+}
+
+// decode-slot display names (fixed order = the motor contract).
+fn dof_label(slot: usize) -> &'static str {
+    const DOF_LABELS: [&str; crate::motor::OUTPUT_CELL_COUNT] =
+        ["DirX", "DirY", "Intensity", "Turn", "FeedSeek", "Emit"];
+    DOF_LABELS.get(slot).copied().unwrap_or("dof")
+}
+
+/// SINGLE-CELL decoder (documented comparison baseline): the best-SNR members
+/// across the annotated motor classes, calibrated per cell from the same
+/// measured probe rates. Installed when no anatomical pool clears the noise
+/// floor, so the queen always has a real-measured decoder.
+fn single_cell_fallback(
+    rt: &mut FlyBrainRuntime,
+    members: &[usize],
+    rates: &[Vec<f32>],
+    sigmas: &[Vec<f32>],
+) {
+    const K: usize = crate::motor::OUTPUT_CELL_COUNT;
+    let n_mem = members.len();
+    let mut snr: Vec<(f32, usize)> = (0..n_mem)
+        .map(|k| {
+            let sig = sigmas.iter().map(|s| s[k]).sum::<f32>() / sigmas.len().max(1) as f32;
+            let r0 = rates[0][k];
+            let spread = rates.iter().map(|r| (r[k] - r0).abs()).fold(0.0f32, f32::max);
+            (spread / sig.max(1.0), k)
+        })
+        .collect();
+    snr.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+    snr.truncate(K);
+    if snr.len() < K {
+        return;
+    }
+    if queen_diag() {
+        eprintln!(
+            "queen decoder: SINGLE-CELL (comparison mode; no defensible population channel) cells={:?}",
+            snr.iter().map(|&(_, k)| members[k]).collect::<Vec<_>>()
+        );
+    }
+    let mut cells = [0usize; K];
+    let mut bl = vec![0f32; K];
+    let mut rg = vec![0f32; K];
+    for (slot, &(_, k)) in snr.iter().enumerate() {
+        let mean_sigma = sigmas.iter().map(|s| s[k]).sum::<f32>() / sigmas.len().max(1) as f32;
+        let r0 = rates[0][k];
+        let spread = rates.iter().map(|r| (r[k] - r0).abs()).fold(0.0f32, f32::max);
+        cells[slot] = members[k];
+        bl[slot] = r0;
+        rg[slot] = spread.max(2.5 * mean_sigma).max(2.0).min(crate::motor::OUTPUT_CALIB_RANGE_MAX_HZ);
+    }
+    if rt.set_output_binding(&cells) {
+        rt.set_motor_calibration(Some(&bl), Some(&rg));
     }
 }

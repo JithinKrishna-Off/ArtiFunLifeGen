@@ -301,6 +301,7 @@ pub struct QueenSnapshot {
 // ------------------------------------------------------------------ helpers
 
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 fn wrap_pi(a: f32) -> f32 {
     let a = if a.is_finite() { a } else { 0.0 };
     let mut a = a;
@@ -314,6 +315,7 @@ fn wrap_pi(a: f32) -> f32 {
 }
 
 #[inline]
+#[cfg_attr(not(test), allow(dead_code))]
 fn san(v: f32) -> f32 {
     if v.is_finite() {
         v

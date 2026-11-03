@@ -484,6 +484,24 @@ pub fn file_sha256(path: &Path) -> Result<String, MaleCnsError> {
 }
 
 /// Convert raw little-endian i32 bytes into a Vec (contiguous, one copy).
+/// Sugar population mapped to ORIGINAL MaleCNS body ids, read from an
+/// imported package dir (`populations/sugar.i32` full-graph indices +
+/// `neurons/body_id.i64`, both flat little-endian arrays per the package
+/// spec). `None` when either file is missing or malformed — callers degrade
+/// to the structural binding honestly (never an invented anatomy).
+pub fn sugar_body_ids(pkg_dir: &std::path::Path) -> Option<Vec<u64>> {
+    let sugar_raw = std::fs::read(pkg_dir.join("populations").join("sugar.i32")).ok()?;
+    let sugar = le_i32s(&sugar_raw, "populations/sugar.i32").ok()?;
+    let bodies_raw = std::fs::read(pkg_dir.join("neurons").join("body_id.i64")).ok()?;
+    let bodies = le_i64s(&bodies_raw, "neurons/body_id.i64").ok()?;
+    let mut out: Vec<u64> = Vec::with_capacity(sugar.len());
+    for s in sugar {
+        let i = usize::try_from(s).ok()?;
+        out.push(*bodies.get(i)? as u64);
+    }
+    Some(out)
+}
+
 fn le_i32s(bytes: &[u8], file: &str) -> Result<Vec<i32>, MaleCnsError> {
     if bytes.len() % 4 != 0 {
         return Err(MaleCnsError::Shape {
@@ -1845,3 +1863,4 @@ mod tests {
         assert!(st.neuron_count == NS as u64);
     }
 }
+

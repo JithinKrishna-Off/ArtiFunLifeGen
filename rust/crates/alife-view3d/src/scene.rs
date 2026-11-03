@@ -12,8 +12,9 @@ use std::sync::Arc;
 /// Compact per-organism render instance. Derived from the real organism by
 /// the UI via `morph` (a signature index, not raw genome).
 ///
-/// Pod byte layout (44 bytes total; all fields are 4-byte scalars in
-/// declaration order; the size is already 8-byte aligned): `is_queen` is a
+/// Pod byte layout (56 bytes total after the additive A3 growth; all fields
+/// are 4-byte scalars in declaration order plus one `u64` id at the end,
+/// seated by the explicit `pad_id` alignment pad): `is_queen` is a
 /// `u32` flag (1 = queen, 0 = plain) so the WGSL path sees a clean f32/u32
 /// float compare; it is consumed by the Queen morph (AGENT: morph_queen) to
 /// route the flagged instance to the reserved queen visual, and is ignored
@@ -51,6 +52,14 @@ pub struct OrgInst {
     /// markers see her true visible crown-to-body scale instead of the
     /// plain `size` clamp. Purely visual: the sim never reads this.
     pub visual_radius_mul: f32,
+    /// explicit 4-byte alignment pad so `id` lands u64-aligned without
+    /// compiler-injected padding (keeps the bytemuck `Pod` derive legal)
+    pub pad_id: u32,
+    /// Sim organism id (additive A3). VIEW-only consumer: the locomotion
+    /// animation (`morph_decomp::LocoTracks`) keys its per-organism stride
+    /// phase / gait-speed state on it. Never touches sim state; `zeroed` /
+    /// legacy rows share id 0 (one best-effort track).
+    pub id: u64,
 }
 
 /// One organism -> render instance (read-only view of the simulation).
@@ -78,6 +87,8 @@ pub fn org_instance(o: &Organism, brand: u32, hue: f32, is_queen: bool) -> OrgIn
         } else {
             1.0
         },
+        id: o.id,
+        pad_id: 0,
     }
 }
 
@@ -141,6 +152,11 @@ pub struct Frame3D {
     pub viewport_px: (f32, f32),
     pub follow_target: Option<(f32, f32)>,
     pub orgs: Vec<OrgInst>,
+    /// A2 lead hook armed per frame: archetype keys parallel to `orgs`
+    /// (`creature_mesh::archetype_key(&morphology::derive(o))`, computed at
+    /// the UI build site where real organisms are in scope). Empty vector =
+    /// no hook (rows render brand fallback archetypes).
+    pub org_arch: Vec<u64>,
     /// atmosphere from the real weather layer: (0..1 coverage values)
     pub rain_cover: f32,
     pub cloud_cover: f32,
